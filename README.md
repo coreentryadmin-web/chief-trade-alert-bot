@@ -1,1 +1,2 @@
-# chief-trade-alert-bot
+# core-entry-discord-bot
+Discord Alert for Alerts
