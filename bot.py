@@ -10,14 +10,10 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
-from fastapi import FastAPI, Request, HTTPException
-import uvicorn
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 UW_API_KEY = os.getenv("UW_API_KEY")
 UW_API_BASE = "https://api.unusualwhales.com"
-TV_SECRET = os.getenv("TV_SECRET")
-TV_CHANNEL_ID = int(os.getenv("TV_CHANNEL_ID", "0"))
 DELETE_CONFIRM_TTL = 30  # second
 # For Railway persistence: change to "/data/bot_data.json" after adding volume
 DATA_FILE = "bot_data.json"
@@ -33,6 +29,14 @@ OPEN_POSITION_ALERT_HOUR_PT = int(os.getenv("OPEN_POSITION_ALERT_HOUR_PT", "13")
 OPEN_POSITION_ALERT_MINUTE_PT = int(os.getenv("OPEN_POSITION_ALERT_MINUTE_PT", "15"))
 # Optional fallback if a user has open trades from old data before channel tracking existed.
 OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNEL_ID", "0"))
+
+# Only these channels will accept trade entries.
+# If both are 0, trade parsing is allowed in all channels.
+ADMIN_ALERTS_CHANNEL_ID = int(os.getenv("ADMIN_ALERTS_CHANNEL_ID", "0"))
+MEMBER_ALERTS_CHANNEL_ID = int(os.getenv("MEMBER_ALERTS_CHANNEL_ID", "0"))
+ALLOWED_TRADE_CHANNEL_IDS = {
+    cid for cid in (ADMIN_ALERTS_CHANNEL_ID, MEMBER_ALERTS_CHANNEL_ID) if cid
+}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1521,6 +1525,12 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # Only process trade entries in approved alert channels, when configured.
+    # Commands like !current, !stats, !daily still work in other channels.
+    if ALLOWED_TRADE_CHANNEL_IDS and message.channel.id not in ALLOWED_TRADE_CHANNEL_IDS:
+        await bot.process_commands(message)
+        return
+
     matched = await process_trade_message(message)
 
     if not matched and looks_like_trade_command(message.content):
@@ -1542,6 +1552,9 @@ async def on_message_edit(before, after):
     if after.author.bot:
         return
 
+    if ALLOWED_TRADE_CHANNEL_IDS and after.channel.id not in ALLOWED_TRADE_CHANNEL_IDS:
+        return
+
     # Already processed when first sent — ignore the edit.
     if pattern.match(before.content):
         return
@@ -1549,131 +1562,9 @@ async def on_message_edit(before, after):
     # Edit turned a non-trade (or malformed trade) into a valid one — process it.
     await process_trade_message(after)
 
-
-# ---------- TradingView webhook (FastAPI) ----------
-app = FastAPI()
-
-
-@app.get("/")
-async def health_check():
-    """Simple health check so Railway / browser tests show the service is alive."""
-    return {"status": "ok", "bot_ready": bot.is_ready()}
-
-
-@app.post("/tv-webhook")
-async def tv_webhook(request: Request):
-    """Receive TradingView alerts (JSON or plain text) and forward to Discord."""
-    if not TV_SECRET or not TV_CHANNEL_ID:
-        raise HTTPException(status_code=500, detail="webhook not configured")
-
-    # Read the raw body once — works for both JSON and plain-text alerts.
-    raw_body = (await request.body()).decode("utf-8", errors="replace").strip()
-    if not raw_body:
-        raise HTTPException(status_code=400, detail="empty body")
-
-    # Try JSON first; fall back to treating the body as plain text.
-    payload = None
-    is_plaintext = False
-    try:
-        parsed = json.loads(raw_body)
-        if isinstance(parsed, dict):
-            payload = parsed
-    except json.JSONDecodeError:
-        payload = None
-
-    if payload is None:
-        is_plaintext = True
-        payload = {"raw": raw_body}
-
-    # Secret check: only enforced on JSON payloads. Plain-text alerts (Inside Bar,
-    # etc.) can't carry a secret field, so the URL itself acts as the access token.
-    # If you want stricter security on plain text, prepend "SECRET=xxx | " to your
-    # TradingView alert message and uncomment the block below.
-    if not is_plaintext and payload.get("secret") != TV_SECRET:
-        raise HTTPException(status_code=401, detail="bad secret")
-
-    # Optional plain-text secret enforcement — uncomment to require it:
-    # if is_plaintext:
-    #     expected = f"SECRET={TV_SECRET}"
-    #     if not raw_body.startswith(expected):
-    #         raise HTTPException(status_code=401, detail="bad secret")
-    #     payload["raw"] = raw_body[len(expected):].lstrip(" |").strip()
-
-    # Build the embed. Two paths: structured JSON or raw text.
-    if is_plaintext:
-        message_text = payload["raw"]
-        upper = message_text.upper()
-        if "BEARISH" in upper or "PUT" in upper or "BREAKDOWN" in upper or "SHORT" in upper:
-            color = discord.Color.red()
-        elif "BULLISH" in upper or "CALL" in upper or "BREAKOUT" in upper or "LONG" in upper:
-            color = discord.Color.green()
-        else:
-            color = discord.Color.gold()
-
-        # Discord embed description max is 4096 chars; truncate just in case.
-        description = message_text if len(message_text) <= 4000 else message_text[:4000] + "…"
-
-        embed = discord.Embed(
-            title="🔔 TradingView Alert",
-            color=color,
-            description=description
-        )
-        embed.set_footer(text="TradingView Signal (plain text)")
-    else:
-        signal = str(payload.get("signal", "UNKNOWN"))
-        ticker = str(payload.get("ticker", "?"))
-        price = str(payload.get("price", "?"))
-        volume = str(payload.get("volume", "?"))
-        interval = str(payload.get("interval", "?"))
-        tv_time = str(payload.get("time", "?"))
-
-        sig_upper = signal.upper()
-        if "PUT" in sig_upper:
-            color = discord.Color.red()
-        elif "CALL" in sig_upper:
-            color = discord.Color.green()
-        else:
-            color = discord.Color.gold()
-
-        embed = discord.Embed(
-            title=f"🔔 {signal}",
-            color=color,
-            description=f"**{ticker}** @ ${price}"
-        )
-        embed.add_field(name="TF", value=interval, inline=True)
-        embed.add_field(name="Volume", value=volume, inline=True)
-        embed.add_field(name="Time", value=tv_time, inline=False)
-        embed.set_footer(text="TradingView Signal")
-
-    channel = bot.get_channel(TV_CHANNEL_ID)
-    if channel is None:
-        raise HTTPException(status_code=500, detail="channel not found")
-
-    try:
-        await channel.send(embed=embed)
-    except discord.HTTPException as e:
-        raise HTTPException(status_code=502, detail=f"discord error: {e}")
-
-    return {"ok": True}
-
-
-async def start_webserver():
-    """Run uvicorn in the same event loop as the Discord bot."""
-    port = int(os.getenv("PORT", "8000"))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
 # ---------- Entry point ----------
+
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN is not set in environment variables")
 
-
-async def main():
-    async with bot:
-        asyncio.create_task(start_webserver())
-        await bot.start(TOKEN)
-
-
-asyncio.run(main())
+bot.run(TOKEN)
