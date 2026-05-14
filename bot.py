@@ -9,14 +9,30 @@ from discord.ext import commands
 from collections import defaultdict
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from zoneinfo import ZoneInfo
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 UW_API_KEY = os.getenv("UW_API_KEY")
 UW_API_BASE = "https://api.unusualwhales.com"
+TV_SECRET = os.getenv("TV_SECRET")
+TV_CHANNEL_ID = int(os.getenv("TV_CHANNEL_ID", "0"))
 DELETE_CONFIRM_TTL = 30  # second
 # For Railway persistence: change to "/data/bot_data.json" after adding volume
 DATA_FILE = "bot_data.json"
 CONTRACT_MULTIPLIER = 100  # Options are worth $100 per contract
+
+# End-of-day automation times use Pacific time (PST/PDT automatically).
+PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
+AUTO_EXPIRE_ENABLED = os.getenv("AUTO_EXPIRE_ENABLED", "true").lower() == "true"
+AUTO_EXPIRE_HOUR_PT = int(os.getenv("AUTO_EXPIRE_HOUR_PT", "13"))
+AUTO_EXPIRE_MINUTE_PT = int(os.getenv("AUTO_EXPIRE_MINUTE_PT", "0"))
+OPEN_POSITION_ALERT_ENABLED = os.getenv("OPEN_POSITION_ALERT_ENABLED", "true").lower() == "true"
+OPEN_POSITION_ALERT_HOUR_PT = int(os.getenv("OPEN_POSITION_ALERT_HOUR_PT", "13"))
+OPEN_POSITION_ALERT_MINUTE_PT = int(os.getenv("OPEN_POSITION_ALERT_MINUTE_PT", "15"))
+# Optional fallback if a user has open trades from old data before channel tracking existed.
+OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNEL_ID", "0"))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -44,6 +60,7 @@ user_stats = defaultdict(lambda: {
 })
 trade_history = defaultdict(list)
 pending_deletes = {}
+last_trade_channels = {}
 
 
 def clean_price_text(price_text: str) -> str:
@@ -345,7 +362,7 @@ def get_format_help_message(message_text: str) -> str:
         return "❌ Invalid strike format. Use strike like `7130c` or `7130p`."
 
     expiry = parts[idx + 2]
-    if not re.match(r'^\d{1,2}/\d{1,2}$', expiry):
+    if not re.match(r'^\d{1,2}/\d{1,2}(?:/\d{2,4})?$', expiry):
         return "❌ Invalid expiry format. Use date like `5/15`, `04/17`, `01/15/28`, or `01/15/2028`."
 
     return (
@@ -381,7 +398,8 @@ def save_data():
         "trade_stats": {},
         "user_stats": {},
         "trade_history": {},
-        "pending_deletes": {}
+        "pending_deletes": {},
+        "last_trade_channels": {}
     }
 
     # Convert positions, preserving Decimal values as strings
@@ -431,6 +449,9 @@ def save_data():
     for user_id, value in pending_deletes.items():
         data["pending_deletes"][str(user_id)] = value
 
+    for user_id, channel_id in last_trade_channels.items():
+        data["last_trade_channels"][str(user_id)] = int(channel_id)
+
     # Write atomically to temp file, then replace
     temp_file = f"{DATA_FILE}.tmp"
     try:
@@ -445,7 +466,7 @@ def save_data():
 
 def load_data():
     """Load data from JSON file, converting strings back to Decimal."""
-    global positions, trade_stats, user_stats, trade_history, pending_deletes
+    global positions, trade_stats, user_stats, trade_history, pending_deletes, last_trade_channels
 
     if not os.path.exists(DATA_FILE):
         return
@@ -516,6 +537,11 @@ def load_data():
     pending_deletes = {
         int(user_id_str): value
         for user_id_str, value in data.get("pending_deletes", {}).items()
+    }
+
+    last_trade_channels = {
+        int(user_id_str): int(channel_id)
+        for user_id_str, channel_id in data.get("last_trade_channels", {}).items()
     }
 
 
@@ -744,6 +770,192 @@ def find_user_ticker_positions(user_id, ticker):
 
     return matches
 
+
+
+
+def parse_expiry_date_pt(expiry: str):
+    """Return expiry date object using the same logic as UW expiry parsing."""
+    try:
+        return datetime.fromisoformat(parse_expiry_to_iso(expiry)).date()
+    except Exception:
+        return None
+
+
+def get_user_alert_channel(user_id: int):
+    """Return the last channel where this user traded, with optional fallback."""
+    channel_id = last_trade_channels.get(user_id) or OPEN_POSITION_FALLBACK_CHANNEL_ID
+    if not channel_id:
+        return None
+    return bot.get_channel(int(channel_id))
+
+
+def format_position_lines(user_positions: list[dict]) -> list[str]:
+    lines = []
+    for pos in user_positions:
+        avg_entry_text = f"${pos['avg_entry']}" if pos["avg_entry"] is not None else "Market/Unknown"
+        lines.append(
+            f"**{pos['ticker']} {pos['strike']} {pos['expiry']}** | "
+            f"{pos['side']} | Qty {pos['qty']} | Avg Entry {avg_entry_text}"
+        )
+    return lines
+
+
+async def auto_expire_positions_once() -> int:
+    """Auto-close expired open contracts at $0.00 and post a notice."""
+    today_pt = datetime.now(PACIFIC_TZ).date()
+    keys_to_expire = []
+
+    for key, lots in list(positions.items()):
+        user_id, ticker, strike, expiry, side = key
+        exp_date = parse_expiry_date_pt(expiry)
+        if exp_date is None:
+            continue
+        if exp_date <= today_pt and sum(lot["qty"] for lot in lots) > 0:
+            keys_to_expire.append(key)
+
+    expired_count = 0
+
+    for key in keys_to_expire:
+        if key not in positions:
+            continue
+
+        user_id, ticker, strike, expiry, side = key
+        lots = positions.get(key, [])
+        qty_to_close = sum(lot["qty"] for lot in lots)
+        if qty_to_close <= 0:
+            continue
+
+        close_action = "STC" if side == "LONG" else "BTC"
+        result = close_position(
+            user_id=user_id,
+            ticker=ticker,
+            strike=strike,
+            expiry=expiry,
+            side=side,
+            close_qty=qty_to_close,
+            exit_price=Decimal("0.00"),
+        )
+
+        if result["matched_qty"] <= 0:
+            continue
+
+        log_trade(
+            user_id=user_id,
+            action=close_action,
+            qty=result["matched_qty"],
+            ticker=ticker,
+            strike=strike,
+            expiry=expiry,
+            price_text="0.00",
+            total_pnl=result["total_pnl"],
+            pnl_pct=result["pnl_pct"],
+        )
+        save_data()
+        expired_count += 1
+
+        channel = get_user_alert_channel(user_id)
+        if channel is None:
+            print(f"[auto-expire] no channel for user {user_id}; expired {ticker} {strike} {expiry}")
+            continue
+
+        user = bot.get_user(user_id)
+        user_text = user.mention if user else f"<@{user_id}>"
+        avg_entry = result["avg_entry_price"]
+        avg_entry_text = f"${avg_entry}" if avg_entry is not None else "Unknown"
+        pnl_text = fmt_money(result["total_pnl"]) if result["total_pnl"] is not None else "Unavailable"
+
+        embed = discord.Embed(
+            title="⏰ Auto-Expired Position",
+            description=(
+                f"{user_text}, this contract expired and was still open.\n\n"
+                f"**{ticker} {strike} {expiry}** | {side} | Qty {result['matched_qty']} | Avg Entry {avg_entry_text}\n\n"
+                f"Auto-closed at **$0.00**\n"
+                f"Realized P/L: **{pnl_text}**"
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text="Core Entry Alerts")
+        await channel.send(embed=embed)
+        await asyncio.sleep(1)
+
+    return expired_count
+
+
+async def post_open_position_reminders_once() -> int:
+    """Post one open-position reminder per user in their last trade channel."""
+    user_ids = sorted({key[0] for key in positions.keys()})
+    sent_count = 0
+
+    for user_id in user_ids:
+        user_positions = summarize_user_positions(user_id)
+        if not user_positions:
+            continue
+
+        channel = get_user_alert_channel(user_id)
+        if channel is None:
+            print(f"[open-alert] no channel for user {user_id}")
+            continue
+
+        lines = format_position_lines(user_positions)
+        user = bot.get_user(user_id)
+        user_text = user.mention if user else f"<@{user_id}>"
+
+        embed = discord.Embed(
+            title="🔔 End-of-Day Open Positions Reminder",
+            description=f"{user_text}, you still have these open:\n\n" + "\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(text="Core Entry Alerts")
+        await channel.send(embed=embed)
+        await asyncio.sleep(1)
+        sent_count += 1
+
+    return sent_count
+
+
+async def end_of_day_task_loop():
+    """Run auto-expiry at 1:00 PM PT and open-position reminders at 1:15 PM PT."""
+    await bot.wait_until_ready()
+
+    last_auto_expire_date = None
+    last_open_alert_date = None
+
+    print(
+        f"[eod] auto-expire {AUTO_EXPIRE_HOUR_PT:02d}:{AUTO_EXPIRE_MINUTE_PT:02d} PT | "
+        f"open reminders {OPEN_POSITION_ALERT_HOUR_PT:02d}:{OPEN_POSITION_ALERT_MINUTE_PT:02d} PT"
+    )
+
+    while not bot.is_closed():
+        now_pt = datetime.now(PACIFIC_TZ)
+        today_key = now_pt.strftime("%Y-%m-%d")
+
+        if (
+            AUTO_EXPIRE_ENABLED
+            and now_pt.hour == AUTO_EXPIRE_HOUR_PT
+            and now_pt.minute == AUTO_EXPIRE_MINUTE_PT
+            and last_auto_expire_date != today_key
+        ):
+            try:
+                count = await auto_expire_positions_once()
+                print(f"[auto-expire] completed for {today_key}; expired_groups={count}")
+            except Exception as e:
+                print(f"[auto-expire] error: {e!r}")
+            last_auto_expire_date = today_key
+
+        if (
+            OPEN_POSITION_ALERT_ENABLED
+            and now_pt.hour == OPEN_POSITION_ALERT_HOUR_PT
+            and now_pt.minute == OPEN_POSITION_ALERT_MINUTE_PT
+            and last_open_alert_date != today_key
+        ):
+            try:
+                count = await post_open_position_reminders_once()
+                print(f"[open-alert] completed for {today_key}; users_notified={count}")
+            except Exception as e:
+                print(f"[open-alert] error: {e!r}")
+            last_open_alert_date = today_key
+
+        await asyncio.sleep(30)
 
 @bot.command(name="current")
 async def current_command(ctx, member: discord.Member = None):
@@ -1092,6 +1304,10 @@ async def on_ready():
     load_data()
     print(f"Logged in as {bot.user}")
 
+    if not hasattr(bot, "eod_task_started"):
+        bot.eod_task_started = True
+        bot.loop.create_task(end_of_day_task_loop())
+
 
 async def process_trade_message(message):
     """Parse a message as a trade and post the embed.
@@ -1111,6 +1327,9 @@ async def process_trade_message(message):
     ticker = ticker.upper().strip()
     strike = strike.upper().strip()
     expiry = expiry.strip()
+
+    # Remember where this user trades so EOD alerts post in the same channel.
+    last_trade_channels[message.author.id] = message.channel.id
 
     numeric_price = parse_price(price_text)
     market_source = None
@@ -1280,9 +1499,6 @@ async def process_trade_message(message):
         if fully_closed:
             embed.add_field(name="Status", value="Position fully closed.", inline=False)
 
-    if market_source:
-        embed.add_field(name="Market Price Source", value=f"UW `{market_source}`", inline=False)
-
     embed.set_author(
         name=message.author.display_name,
         icon_url=message.author.display_avatar.url
@@ -1333,9 +1549,131 @@ async def on_message_edit(before, after):
     # Edit turned a non-trade (or malformed trade) into a valid one — process it.
     await process_trade_message(after)
 
-# ---------- Entry point ----------
 
+# ---------- TradingView webhook (FastAPI) ----------
+app = FastAPI()
+
+
+@app.get("/")
+async def health_check():
+    """Simple health check so Railway / browser tests show the service is alive."""
+    return {"status": "ok", "bot_ready": bot.is_ready()}
+
+
+@app.post("/tv-webhook")
+async def tv_webhook(request: Request):
+    """Receive TradingView alerts (JSON or plain text) and forward to Discord."""
+    if not TV_SECRET or not TV_CHANNEL_ID:
+        raise HTTPException(status_code=500, detail="webhook not configured")
+
+    # Read the raw body once — works for both JSON and plain-text alerts.
+    raw_body = (await request.body()).decode("utf-8", errors="replace").strip()
+    if not raw_body:
+        raise HTTPException(status_code=400, detail="empty body")
+
+    # Try JSON first; fall back to treating the body as plain text.
+    payload = None
+    is_plaintext = False
+    try:
+        parsed = json.loads(raw_body)
+        if isinstance(parsed, dict):
+            payload = parsed
+    except json.JSONDecodeError:
+        payload = None
+
+    if payload is None:
+        is_plaintext = True
+        payload = {"raw": raw_body}
+
+    # Secret check: only enforced on JSON payloads. Plain-text alerts (Inside Bar,
+    # etc.) can't carry a secret field, so the URL itself acts as the access token.
+    # If you want stricter security on plain text, prepend "SECRET=xxx | " to your
+    # TradingView alert message and uncomment the block below.
+    if not is_plaintext and payload.get("secret") != TV_SECRET:
+        raise HTTPException(status_code=401, detail="bad secret")
+
+    # Optional plain-text secret enforcement — uncomment to require it:
+    # if is_plaintext:
+    #     expected = f"SECRET={TV_SECRET}"
+    #     if not raw_body.startswith(expected):
+    #         raise HTTPException(status_code=401, detail="bad secret")
+    #     payload["raw"] = raw_body[len(expected):].lstrip(" |").strip()
+
+    # Build the embed. Two paths: structured JSON or raw text.
+    if is_plaintext:
+        message_text = payload["raw"]
+        upper = message_text.upper()
+        if "BEARISH" in upper or "PUT" in upper or "BREAKDOWN" in upper or "SHORT" in upper:
+            color = discord.Color.red()
+        elif "BULLISH" in upper or "CALL" in upper or "BREAKOUT" in upper or "LONG" in upper:
+            color = discord.Color.green()
+        else:
+            color = discord.Color.gold()
+
+        # Discord embed description max is 4096 chars; truncate just in case.
+        description = message_text if len(message_text) <= 4000 else message_text[:4000] + "…"
+
+        embed = discord.Embed(
+            title="🔔 TradingView Alert",
+            color=color,
+            description=description
+        )
+        embed.set_footer(text="TradingView Signal (plain text)")
+    else:
+        signal = str(payload.get("signal", "UNKNOWN"))
+        ticker = str(payload.get("ticker", "?"))
+        price = str(payload.get("price", "?"))
+        volume = str(payload.get("volume", "?"))
+        interval = str(payload.get("interval", "?"))
+        tv_time = str(payload.get("time", "?"))
+
+        sig_upper = signal.upper()
+        if "PUT" in sig_upper:
+            color = discord.Color.red()
+        elif "CALL" in sig_upper:
+            color = discord.Color.green()
+        else:
+            color = discord.Color.gold()
+
+        embed = discord.Embed(
+            title=f"🔔 {signal}",
+            color=color,
+            description=f"**{ticker}** @ ${price}"
+        )
+        embed.add_field(name="TF", value=interval, inline=True)
+        embed.add_field(name="Volume", value=volume, inline=True)
+        embed.add_field(name="Time", value=tv_time, inline=False)
+        embed.set_footer(text="TradingView Signal")
+
+    channel = bot.get_channel(TV_CHANNEL_ID)
+    if channel is None:
+        raise HTTPException(status_code=500, detail="channel not found")
+
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException as e:
+        raise HTTPException(status_code=502, detail=f"discord error: {e}")
+
+    return {"ok": True}
+
+
+async def start_webserver():
+    """Run uvicorn in the same event loop as the Discord bot."""
+    port = int(os.getenv("PORT", "8000"))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+# ---------- Entry point ----------
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN is not set in environment variables")
 
-bot.run(TOKEN)
+
+async def main():
+    async with bot:
+        asyncio.create_task(start_webserver())
+        await bot.start(TOKEN)
+
+
+asyncio.run(main())
