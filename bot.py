@@ -16,7 +16,7 @@ UW_API_KEY = os.getenv("UW_API_KEY")
 UW_API_BASE = "https://api.unusualwhales.com"
 DELETE_CONFIRM_TTL = 30  # second
 # For Railway persistence: change to "/data/bot_data.json" after adding volume
-DATA_FILE = "bot_data.json"
+DATA_FILE = "/data/bot_data.json"
 CONTRACT_MULTIPLIER = 100  # Options are worth $100 per contract
 
 # End-of-day automation times use Pacific time (PST/PDT automatically).
