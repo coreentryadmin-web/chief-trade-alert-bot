@@ -11,8 +11,6 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-os.makedirs("/data", exist_ok=True)
-
 TOKEN = os.getenv("DISCORD_TOKEN")
 UW_API_KEY = os.getenv("UW_API_KEY")
 UW_API_BASE = "https://api.unusualwhales.com"
@@ -32,6 +30,10 @@ OPEN_POSITION_ALERT_MINUTE_PT = int(os.getenv("OPEN_POSITION_ALERT_MINUTE_PT", "
 # Optional fallback if a user has open trades from old data before channel tracking existed.
 OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNEL_ID", "0"))
 
+# Monthly tournament settings
+TOURNAMENT_MIN_CLOSED_TRADES = int(os.getenv("TOURNAMENT_MIN_CLOSED_TRADES", "5"))
+TOURNAMENT_MAX_GAIN_PER_TRADE = Decimal(os.getenv("TOURNAMENT_MAX_GAIN_PER_TRADE", "100"))
+
 # Only these channels will accept trade entries.
 # If both are 0, trade parsing is allowed in all channels.
 ADMIN_ALERTS_CHANNEL_ID = int(os.getenv("ADMIN_ALERTS_CHANNEL_ID", "0"))
@@ -44,7 +46,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # Qty optional; defaults to 1 if omitted
 pattern = re.compile(
@@ -67,6 +69,7 @@ user_stats = defaultdict(lambda: {
 trade_history = defaultdict(list)
 pending_deletes = {}
 last_trade_channels = {}
+tournament_players = {}
 
 
 def clean_price_text(price_text: str) -> str:
@@ -405,7 +408,8 @@ def save_data():
         "user_stats": {},
         "trade_history": {},
         "pending_deletes": {},
-        "last_trade_channels": {}
+        "last_trade_channels": {},
+        "tournament_players": {}
     }
 
     # Convert positions, preserving Decimal values as strings
@@ -458,6 +462,12 @@ def save_data():
     for user_id, channel_id in last_trade_channels.items():
         data["last_trade_channels"][str(user_id)] = int(channel_id)
 
+    for user_id, value in tournament_players.items():
+        data["tournament_players"][str(user_id)] = {
+            "joined_at": value.get("joined_at"),
+            "active": bool(value.get("active", True))
+        }
+
     # Write atomically to temp file, then replace
     temp_file = f"{DATA_FILE}.tmp"
     try:
@@ -472,7 +482,7 @@ def save_data():
 
 def load_data():
     """Load data from JSON file, converting strings back to Decimal."""
-    global positions, trade_stats, user_stats, trade_history, pending_deletes, last_trade_channels
+    global positions, trade_stats, user_stats, trade_history, pending_deletes, last_trade_channels, tournament_players
 
     if not os.path.exists(DATA_FILE):
         return
@@ -548,6 +558,14 @@ def load_data():
     last_trade_channels = {
         int(user_id_str): int(channel_id)
         for user_id_str, channel_id in data.get("last_trade_channels", {}).items()
+    }
+
+    tournament_players = {
+        int(user_id_str): {
+            "joined_at": value.get("joined_at"),
+            "active": bool(value.get("active", True))
+        }
+        for user_id_str, value in data.get("tournament_players", {}).items()
     }
 
 
@@ -962,6 +980,256 @@ async def end_of_day_task_loop():
             last_open_alert_date = today_key
 
         await asyncio.sleep(30)
+
+
+# ---------- Help + Tournament Commands ----------
+
+def _month_start_utc(now: datetime | None = None) -> datetime:
+    now = now or datetime.utcnow()
+    return datetime(now.year, now.month, 1)
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _eligible_tournament_trades(user_id: int) -> list[dict]:
+    player = tournament_players.get(user_id)
+    if not player or not player.get("active", True):
+        return []
+
+    joined_at = _parse_iso_datetime(player.get("joined_at"))
+    month_start = _month_start_utc()
+    start = max(joined_at, month_start) if joined_at else month_start
+
+    trades = []
+    for trade in trade_history.get(user_id, []):
+        if trade.get("action") not in ("STC", "BTC"):
+            continue
+        if trade.get("pnl_pct") is None:
+            continue
+        try:
+            trade_time = datetime.fromisoformat(trade["timestamp"])
+        except Exception:
+            continue
+        if trade_time >= start:
+            trades.append(trade)
+    return trades
+
+
+def _tournament_score(user_id: int) -> dict:
+    trades = _eligible_tournament_trades(user_id)
+    closed_trades = len(trades)
+    score = Decimal("0.00")
+    wins = losses = flat = 0
+
+    for trade in trades:
+        pct = Decimal(str(trade.get("pnl_pct") or "0"))
+        if TOURNAMENT_MAX_GAIN_PER_TRADE > 0 and pct > TOURNAMENT_MAX_GAIN_PER_TRADE:
+            pct = TOURNAMENT_MAX_GAIN_PER_TRADE
+        score += pct
+        if pct > 0:
+            wins += 1
+        elif pct < 0:
+            losses += 1
+        else:
+            flat += 1
+
+    decided = wins + losses
+    win_rate = (wins / decided * 100) if decided else 0.0
+
+    return {
+        "score": score.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
+        "closed_trades": closed_trades,
+        "wins": wins,
+        "losses": losses,
+        "flat": flat,
+        "win_rate": win_rate,
+        "qualified": closed_trades >= TOURNAMENT_MIN_CLOSED_TRADES,
+    }
+
+
+def _leaderboard_rows() -> list[tuple[int, dict]]:
+    rows = []
+    for user_id, player in tournament_players.items():
+        if not player.get("active", True):
+            continue
+        stats = _tournament_score(user_id)
+        rows.append((user_id, stats))
+    rows.sort(key=lambda row: (row[1]["qualified"], row[1]["score"], row[1]["closed_trades"]), reverse=True)
+    return rows
+
+
+@bot.command(name="help")
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="📘 BLACKOUT Trade Bot Help",
+        description=(
+            "Log option trades, track open positions, calculate P/L, and compete in the monthly tournament.\n\n"
+            "**Trade Format**\n"
+            "`[action] [qty optional] [ticker] [strike][c/p] [expiry] @ [price]`\n\n"
+            "**Examples**\n"
+            "`bto spy 590c 5/16 @ 1.25`\n"
+            "`bto 5 spy 590c 5/16 @ 1.25`\n"
+            "`stc spy 590c 5/16 @ 2.10`\n"
+            "`bto spx 7130c 5/15 @m`\n\n"
+            "`@m` = market price using UW option contract data."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="Actions",
+        value="`BTO` Buy To Open\n`STC` Sell To Close\n`STO` Sell To Open\n`BTC` Buy To Close",
+        inline=False,
+    )
+    embed.add_field(
+        name="Tracking Commands",
+        value=(
+            "`!current` → open positions\n"
+            "`!stats` → trader stats\n"
+            "`!profit` → all-time realized P/L\n"
+            "`!daily` → today's trades + P/L\n"
+            "`!history` or `!trades` → last 30 days\n"
+            "`!delete TICKER` → delete open positions\n"
+            "`!confirm` → confirm delete request"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Tournament Commands",
+        value=(
+            "`!join` → join the monthly tournament\n"
+            "`!leaderboard` → monthly rankings\n"
+            "`!rank` → your current tournament rank\n"
+            "`!tournament` → rules and scoring"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="BLACKOUT Trade Alerts")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="join")
+async def join_command(ctx):
+    user_id = ctx.author.id
+    if user_id in tournament_players and tournament_players[user_id].get("active", True):
+        joined_at = tournament_players[user_id].get("joined_at", "already joined")
+        await ctx.send(f"✅ {ctx.author.mention}, you are already in the BLACKOUT Monthly Tournament. Joined: `{joined_at}`")
+        return
+
+    tournament_players[user_id] = {
+        "joined_at": datetime.utcnow().isoformat(),
+        "active": True,
+    }
+    save_data()
+
+    embed = discord.Embed(
+        title="✅ Tournament Joined",
+        description=(
+            f"{ctx.author.mention}, you joined the **BLACKOUT Monthly Tournament**.\n\n"
+            "Only trades posted **after joining** will count.\n"
+            "Only **closed trades** count toward the leaderboard.\n\n"
+            "Good luck. 🔥"
+        ),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="BLACKOUT Monthly Tournament")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="tournament")
+async def tournament_command(ctx):
+    month_label = datetime.utcnow().strftime("%B %Y")
+    embed = discord.Embed(
+        title=f"🏆 BLACKOUT Monthly Tournament — {month_label}",
+        description=(
+            "**How to enter**\n"
+            "Type `!join` before posting tournament trades.\n\n"
+            "**Scoring**\n"
+            "• Only bot-logged trades count\n"
+            "• Only closed trades count\n"
+            "• Score = sum of closed trade % gains for the month\n"
+            f"• Minimum `{TOURNAMENT_MIN_CLOSED_TRADES}` closed trades required to qualify\n"
+            f"• Max counted gain per trade: `{TOURNAMENT_MAX_GAIN_PER_TRADE}%`\n\n"
+            "**Commands**\n"
+            "`!leaderboard` → rankings\n"
+            "`!rank` → your rank\n"
+            "`!current` → open positions"
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text="Leaderboard resets on the 1st of each month")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="leaderboard", aliases=["lb"])
+async def leaderboard_command(ctx):
+    rows = _leaderboard_rows()
+    month_label = datetime.utcnow().strftime("%B %Y")
+
+    if not rows:
+        await ctx.send("No one has joined the tournament yet. Type `!join` to enter.")
+        return
+
+    medal = ["🥇", "🥈", "🥉"]
+    lines = []
+    for idx, (user_id, stats) in enumerate(rows[:10], start=1):
+        user = bot.get_user(user_id)
+        name = user.display_name if user else f"User {user_id}"
+        prefix = medal[idx - 1] if idx <= 3 else f"#{idx}"
+        q = "✅" if stats["qualified"] else f"Needs {max(0, TOURNAMENT_MIN_CLOSED_TRADES - stats['closed_trades'])} more"
+        lines.append(
+            f"{prefix} **{name}** — **{fmt_pct(stats['score'])}** "
+            f"| {stats['closed_trades']} closed | Win Rate {stats['win_rate']:.1f}% | {q}"
+        )
+
+    embed = discord.Embed(
+        title=f"🏆 BLACKOUT Monthly Leaderboard — {month_label}",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"Minimum {TOURNAMENT_MIN_CLOSED_TRADES} closed trades to qualify · Closed trades only")
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="rank")
+async def rank_command(ctx):
+    user_id = ctx.author.id
+    if user_id not in tournament_players or not tournament_players[user_id].get("active", True):
+        await ctx.send("You are not in the tournament yet. Type `!join` to enter.")
+        return
+
+    rows = _leaderboard_rows()
+    rank = next((i for i, (uid, _) in enumerate(rows, start=1) if uid == user_id), None)
+    stats = _tournament_score(user_id)
+    needed = max(0, TOURNAMENT_MIN_CLOSED_TRADES - stats["closed_trades"])
+
+    description = (
+        f"**Rank:** #{rank if rank else '—'}\n"
+        f"**Monthly Score:** {fmt_pct(stats['score'])}\n"
+        f"**Closed Trades:** {stats['closed_trades']}\n"
+        f"**Win Rate:** {stats['win_rate']:.1f}%\n"
+        f"**Wins/Losses/Flat:** {stats['wins']} / {stats['losses']} / {stats['flat']}\n"
+    )
+    if stats["qualified"]:
+        description += "\n✅ You are qualified for prizes."
+    else:
+        description += f"\n⚠️ You need `{needed}` more closed trade(s) to qualify."
+
+    embed = discord.Embed(
+        title="📊 Your Tournament Rank",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
+    embed.set_footer(text="BLACKOUT Monthly Tournament")
+    await ctx.send(embed=embed)
+
 
 @bot.command(name="current")
 async def current_command(ctx, member: discord.Member = None):
