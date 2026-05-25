@@ -42,6 +42,11 @@ TOURNAMENT_RESULTS_CHANNEL_ID = int(os.getenv("TOURNAMENT_RESULTS_CHANNEL_ID", "
 TOURNAMENT_RESULTS_HOUR_PT = int(os.getenv("TOURNAMENT_RESULTS_HOUR_PT", "23"))
 TOURNAMENT_RESULTS_MINUTE_PT = int(os.getenv("TOURNAMENT_RESULTS_MINUTE_PT", "55"))
 
+# Registration announcement at 25th of each month
+REGISTRATION_ANNOUNCEMENT_ENABLED = os.getenv("REGISTRATION_ANNOUNCEMENT_ENABLED", "true").lower() == "true"
+REGISTRATION_ANNOUNCEMENT_HOUR_PT = int(os.getenv("REGISTRATION_ANNOUNCEMENT_HOUR_PT", "9"))
+REGISTRATION_ANNOUNCEMENT_MINUTE_PT = int(os.getenv("REGISTRATION_ANNOUNCEMENT_MINUTE_PT", "0"))
+
 # Only these channels will accept trade entries.
 # If both are 0, trade parsing is allowed in all channels.
 ADMIN_ALERTS_CHANNEL_ID = int(os.getenv("ADMIN_ALERTS_CHANNEL_ID", "0"))
@@ -1238,6 +1243,70 @@ async def tournament_results_task_loop():
         await asyncio.sleep(30)
 
 
+async def announce_registration_window_once() -> bool:
+    """Announce registration window opening on the 25th of each month."""
+    channel = _resolve_tournament_results_channel()
+    if channel is None:
+        print("[registration-announce] no announcement channel found")
+        return False
+
+    now_pt = datetime.now(PACIFIC_TZ)
+    upcoming_month = _registration_effective_month(now_pt)
+    month_label = _month_bounds_utc_from_effective_month(upcoming_month)[2]
+
+    embed = discord.Embed(
+        title="🎉 Tournament Registration Opens",
+        description=(
+            f"Registration for the **{month_label}** BLACKOUT Monthly Tournament is now open!\n\n"
+            f"**Registration Window:** Today through {(now_pt + timedelta(days=8)).strftime('%B %d')}\n\n"
+            f"**How to Join:**\n"
+            f"Type `!join` to register for the {month_label} challenge.\n\n"
+            f"**Tournament Details:**\n"
+            f"• Trades count from the 1st to the last day of {month_label.split()[0]}\n"
+            f"• Only closed trades count toward your score\n"
+            f"• Minimum {TOURNAMENT_MIN_CLOSED_TRADES} closed trades required to qualify\n"
+            f"• Score = sum of all closed trade % gains\n\n"
+            f"Type `!tournament` for full rules and scoring details."
+        ),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text="BLACKOUT Monthly Tournament")
+    await channel.send(embed=embed)
+    print(f"[registration-announce] announced {month_label} registration opening")
+    return True
+
+
+async def registration_announcement_task_loop():
+    """Announce registration window on the 25th of each month."""
+    await bot.wait_until_ready()
+
+    print(
+        f"[registration-announce] enabled={REGISTRATION_ANNOUNCEMENT_ENABLED} "
+        f"time={REGISTRATION_ANNOUNCEMENT_HOUR_PT:02d}:{REGISTRATION_ANNOUNCEMENT_MINUTE_PT:02d} PT"
+    )
+
+    last_announcement_date = None
+
+    while not bot.is_closed():
+        now_pt = datetime.now(PACIFIC_TZ)
+        today_key = now_pt.strftime("%Y-%m-%d")
+
+        if (
+            REGISTRATION_ANNOUNCEMENT_ENABLED
+            and now_pt.day == 25
+            and now_pt.hour == REGISTRATION_ANNOUNCEMENT_HOUR_PT
+            and now_pt.minute == REGISTRATION_ANNOUNCEMENT_MINUTE_PT
+            and last_announcement_date != today_key
+        ):
+            try:
+                await announce_registration_window_once()
+            except Exception as e:
+                print(f"[registration-announce] error: {e!r}")
+            last_announcement_date = today_key
+
+        await asyncio.sleep(30)
+
+
 @bot.command(name="help")
 async def help_command(ctx):
     embed = discord.Embed(
@@ -1851,6 +1920,10 @@ async def on_ready():
     if not hasattr(bot, "tournament_results_task_started"):
         bot.tournament_results_task_started = True
         bot.loop.create_task(tournament_results_task_loop())
+
+    if not hasattr(bot, "registration_announcement_task_started"):
+        bot.registration_announcement_task_started = True
+        bot.loop.create_task(registration_announcement_task_loop())
 
 
 async def process_trade_message(message):
