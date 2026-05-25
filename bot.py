@@ -475,6 +475,7 @@ def save_data():
     for user_id, value in tournament_players.items():
         data["tournament_players"][str(user_id)] = {
             "joined_at": value.get("joined_at"),
+            "effective_month": value.get("effective_month"),
             "active": bool(value.get("active", True))
         }
 
@@ -575,6 +576,7 @@ def load_data():
     tournament_players = {
         int(user_id_str): {
             "joined_at": value.get("joined_at"),
+            "effective_month": value.get("effective_month") or _current_tournament_month(),
             "active": bool(value.get("active", True))
         }
         for user_id_str, value in data.get("tournament_players", {}).items()
@@ -1047,11 +1049,10 @@ def _eligible_tournament_trades(
     if not player or not player.get("active", True):
         return []
 
-    if month_start is None or month_end is None:
-        month_start, month_end, _ = _month_bounds_utc_from_pt()
+    effective_month = player.get("effective_month") or _current_tournament_month()
 
-    joined_at = _parse_iso_datetime(player.get("joined_at"))
-    start = max(joined_at, month_start) if joined_at else month_start
+    if month_start is None or month_end is None:
+        month_start, month_end, _ = _month_bounds_utc_from_effective_month(effective_month)
 
     trades = []
     for trade in trade_history.get(user_id, []):
@@ -1063,7 +1064,7 @@ def _eligible_tournament_trades(
             trade_time = datetime.fromisoformat(trade["timestamp"])
         except Exception:
             continue
-        if start <= trade_time < month_end:
+        if month_start <= trade_time < month_end:
             trades.append(trade)
     return trades
 
@@ -1107,13 +1108,19 @@ def _tournament_score(
 def _leaderboard_rows(
     month_start: datetime | None = None,
     month_end: datetime | None = None,
+    effective_month: str | None = None,
 ) -> list[tuple[int, dict]]:
     rows = []
+    effective_month = effective_month or _current_tournament_month()
+
     for user_id, player in tournament_players.items():
         if not player.get("active", True):
             continue
+        if player.get("effective_month") != effective_month:
+            continue
         stats = _tournament_score(user_id, month_start, month_end)
         rows.append((user_id, stats))
+
     rows.sort(key=lambda row: (row[1]["qualified"], row[1]["score"], row[1]["closed_trades"]), reverse=True)
     return rows
 
@@ -1138,7 +1145,7 @@ def _resolve_tournament_results_channel():
 
 
 def _build_monthly_results_embed(month_start: datetime, month_end: datetime, month_label: str) -> discord.Embed:
-    rows = _leaderboard_rows(month_start, month_end)
+    rows = _leaderboard_rows(month_start, month_end, month_start.strftime("%Y-%m"))
     qualified = [(uid, stats) for uid, stats in rows if stats["qualified"]]
 
     if not rows:
@@ -1280,19 +1287,57 @@ async def help_command(ctx):
     await ctx.send(embed=embed)
 
 
+
+def _registration_effective_month(now_pt: datetime | None = None) -> str:
+    """Return YYYY-MM tournament month for a registration.
+
+    Registration window is 25th through 2nd:
+      - 25th-end of month registers for next month
+      - 1st-2nd registers for current month
+    """
+    now_pt = now_pt or datetime.now(PACIFIC_TZ)
+
+    if now_pt.day >= 25:
+        if now_pt.month == 12:
+            return f"{now_pt.year + 1}-01"
+        return f"{now_pt.year}-{now_pt.month + 1:02d}"
+
+    return f"{now_pt.year}-{now_pt.month:02d}"
+
+
+def _month_bounds_utc_from_effective_month(effective_month: str) -> tuple[datetime, datetime, str]:
+    """Return UTC-naive month bounds for an effective YYYY-MM tournament month."""
+    year_s, month_s = effective_month.split("-", 1)
+    year = int(year_s)
+    month = int(month_s)
+
+    start_pt = datetime(year, month, 1, tzinfo=PACIFIC_TZ)
+
+    if month == 12:
+        next_start_pt = datetime(year + 1, 1, 1, tzinfo=PACIFIC_TZ)
+    else:
+        next_start_pt = datetime(year, month + 1, 1, tzinfo=PACIFIC_TZ)
+
+    start_utc = start_pt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    end_utc = next_start_pt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    label = start_pt.strftime("%B %Y")
+
+    return start_utc, end_utc, label
+
+
+def _current_tournament_month() -> str:
+    """Current tournament month in Pacific time, formatted YYYY-MM."""
+    now_pt = datetime.now(PACIFIC_TZ)
+    return f"{now_pt.year}-{now_pt.month:02d}"
+
+
+
 @bot.command(name="join")
 async def join_command(ctx):
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
+    now_pt = datetime.now(PACIFIC_TZ)
 
-    ET = ZoneInfo("America/New_York")
-    now = datetime.now(ET)
-
-    # Opens on 25th of current month
-    # Closes after the 2nd of next month
-
-    if not (now.day >= 25 or now.day <= 2):
-        
+    # Registration window: 25th-31st and 1st-2nd
+    if not (now_pt.day >= 25 or now_pt.day <= 2):
         await ctx.send(
             "❌ Tournament registration is closed for this month.\n"
             "Registration opens again at month end."
@@ -1300,22 +1345,37 @@ async def join_command(ctx):
         return
 
     user_id = ctx.author.id
+    effective_month = _registration_effective_month(now_pt)
+
+    # Check if ALREADY registered for THIS month
     if user_id in tournament_players and tournament_players[user_id].get("active", True):
-        joined_at = tournament_players[user_id].get("joined_at", "already joined")
-        await ctx.send(f"✅ {ctx.author.mention}, you are already in the BLACKOUT Monthly Tournament. Joined: `{joined_at}`")
-        return
+        player_month = tournament_players[user_id].get("effective_month") or _current_tournament_month()
+        
+        if player_month == effective_month:
+            # Already registered for this month
+            joined_at = tournament_players[user_id].get("joined_at", "already joined")
+            month_label = _month_bounds_utc_from_effective_month(effective_month)[2]
+            await ctx.send(
+                f"✅ {ctx.author.mention}, you are already registered for the **{month_label}** BLACKOUT Monthly Tournament. "
+                f"Joined: `{joined_at}`"
+            )
+            return
+        # Otherwise allow re-registration for new month (don't return)
 
     tournament_players[user_id] = {
         "joined_at": datetime.utcnow().isoformat(),
+        "effective_month": effective_month,
         "active": True,
     }
     save_data()
 
+    month_label = _month_bounds_utc_from_effective_month(effective_month)[2]
     embed = discord.Embed(
         title="✅ Tournament Joined",
         description=(
             f"{ctx.author.mention}, you joined the **BLACKOUT Monthly Tournament**.\n\n"
-            "Only trades posted **after joining** will count.\n"
+            f"Your registration is for **{month_label}**.\n"
+            f"Trades start counting from **{month_label.split()[0]} 1st**.\n"
             "Only **closed trades** count toward the leaderboard.\n\n"
             "Good luck. 🔥"
         ),
@@ -1352,11 +1412,25 @@ async def tournament_command(ctx):
 
 @bot.command(name="leaderboard", aliases=["lb"])
 async def leaderboard_command(ctx):
-    rows = _leaderboard_rows()
-    _, _, month_label = _month_bounds_utc_from_pt()
+    # During registration window (25th-2nd), show upcoming month
+    # Otherwise show current calendar month
+    now_pt = datetime.now(PACIFIC_TZ)
+    
+    if now_pt.day >= 25 or now_pt.day <= 2:
+        # Registration window - show the month being registered for
+        effective_month = _registration_effective_month(now_pt)
+    else:
+        # Regular tournament period - show current calendar month
+        effective_month = _current_tournament_month()
+    
+    rows = _leaderboard_rows(effective_month=effective_month)
+    month_label = _month_bounds_utc_from_effective_month(effective_month)[2]
 
     if not rows:
-        await ctx.send("No one has joined the tournament yet. Type `!join` to enter.")
+        await ctx.send(
+            f"No one has joined the **{month_label}** tournament yet. "
+            "Type `!join` to enter."
+        )
         return
 
     medal = ["🥇", "🥈", "🥉"]
@@ -1387,12 +1461,21 @@ async def rank_command(ctx):
         await ctx.send("You are not in the tournament yet. Type `!join` to enter.")
         return
 
-    rows = _leaderboard_rows()
+    # Get the user's registered tournament month
+    player = tournament_players[user_id]
+    effective_month = player.get("effective_month") or _current_tournament_month()
+    
+    # Get leaderboard for their tournament month (not current calendar month)
+    rows = _leaderboard_rows(effective_month=effective_month)
     rank = next((i for i, (uid, _) in enumerate(rows, start=1) if uid == user_id), None)
+    
     stats = _tournament_score(user_id)
     needed = max(0, TOURNAMENT_MIN_CLOSED_TRADES - stats["closed_trades"])
+    
+    month_label = _month_bounds_utc_from_effective_month(effective_month)[2]
 
     description = (
+        f"**Tournament:** {month_label}\n"
         f"**Rank:** #{rank if rank else '—'}\n"
         f"**Monthly Score:** {fmt_pct(stats['score'])}\n"
         f"**Closed Trades:** {stats['closed_trades']}\n"
