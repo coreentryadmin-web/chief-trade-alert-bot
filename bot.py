@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
+os.makedirs("/data", exist_ok=True)
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 UW_API_KEY = os.getenv("UW_API_KEY")
 UW_API_BASE = "https://api.unusualwhales.com"
