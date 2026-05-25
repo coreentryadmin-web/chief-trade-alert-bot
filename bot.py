@@ -32,7 +32,10 @@ OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNE
 
 # Monthly tournament settings
 TOURNAMENT_MIN_CLOSED_TRADES = int(os.getenv("TOURNAMENT_MIN_CLOSED_TRADES", "5"))
-TOURNAMENT_MAX_GAIN_PER_TRADE = Decimal(os.getenv("TOURNAMENT_MAX_GAIN_PER_TRADE", "100"))
+# TOURNAMENT_MAX_GAIN_PER_TRADE: 0 (or negative) = no cap, use actual % gains
+# Positive number = cap per trade (e.g., 100 = max +100% per trade)
+_max_gain_env = os.getenv("TOURNAMENT_MAX_GAIN_PER_TRADE", "0")
+TOURNAMENT_MAX_GAIN_PER_TRADE = Decimal(_max_gain_env) if _max_gain_env else Decimal("0")
 
 # Automatic month-end tournament results.
 # If TOURNAMENT_RESULTS_CHANNEL_ID is not set, the bot falls back to MEMBER_ALERTS_CHANNEL_ID,
@@ -1086,6 +1089,7 @@ def _tournament_score(
 
     for trade in trades:
         pct = Decimal(str(trade.get("pnl_pct") or "0"))
+        # Only apply cap if TOURNAMENT_MAX_GAIN_PER_TRADE > 0 (0 or negative = no cap)
         if TOURNAMENT_MAX_GAIN_PER_TRADE > 0 and pct > TOURNAMENT_MAX_GAIN_PER_TRADE:
             pct = TOURNAMENT_MAX_GAIN_PER_TRADE
         score += pct
@@ -1254,6 +1258,12 @@ async def announce_registration_window_once() -> bool:
     upcoming_month = _registration_effective_month(now_pt)
     month_label = _month_bounds_utc_from_effective_month(upcoming_month)[2]
 
+    max_gain_line = (
+        f"• Max gain per trade capped at {TOURNAMENT_MAX_GAIN_PER_TRADE}%\n"
+        if TOURNAMENT_MAX_GAIN_PER_TRADE > 0
+        else "• No cap on gains — unlimited upside\n"
+    )
+    
     embed = discord.Embed(
         title="🎉 Tournament Registration Opens",
         description=(
@@ -1265,7 +1275,8 @@ async def announce_registration_window_once() -> bool:
             f"• Trades count from the 1st to the last day of {month_label.split()[0]}\n"
             f"• Only closed trades count toward your score\n"
             f"• Minimum {TOURNAMENT_MIN_CLOSED_TRADES} closed trades required to qualify\n"
-            f"• Score = sum of all closed trade % gains\n\n"
+            f"• Score = sum of all closed trade % gains\n"
+            f"{max_gain_line}\n"
             f"Type `!tournament` for full rules and scoring details."
         ),
         color=discord.Color.green(),
@@ -1460,6 +1471,13 @@ async def join_command(ctx):
 @bot.command(name="tournament")
 async def tournament_command(ctx):
     _, _, month_label = _month_bounds_utc_from_pt()
+    
+    max_gain_text = (
+        f"`{TOURNAMENT_MAX_GAIN_PER_TRADE}%` per trade" 
+        if TOURNAMENT_MAX_GAIN_PER_TRADE > 0 
+        else "Unlimited (no cap)"
+    )
+    
     embed = discord.Embed(
         title=f"🏆 BLACKOUT Monthly Tournament — {month_label}",
         description=(
@@ -1470,7 +1488,7 @@ async def tournament_command(ctx):
             "• Only closed trades count\n"
             "• Score = sum of closed trade % gains for the month\n"
             f"• Minimum `{TOURNAMENT_MIN_CLOSED_TRADES}` closed trades required to qualify\n"
-            f"• Max counted gain per trade: `{TOURNAMENT_MAX_GAIN_PER_TRADE}%`\n\n"
+            f"• Max gain per trade: {max_gain_text}\n\n"
             "**Commands**\n"
             "`!leaderboard` → rankings\n"
             "`!rank` → your rank\n"
