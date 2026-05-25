@@ -34,6 +34,14 @@ OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNE
 TOURNAMENT_MIN_CLOSED_TRADES = int(os.getenv("TOURNAMENT_MIN_CLOSED_TRADES", "5"))
 TOURNAMENT_MAX_GAIN_PER_TRADE = Decimal(os.getenv("TOURNAMENT_MAX_GAIN_PER_TRADE", "100"))
 
+# Automatic month-end tournament results.
+# If TOURNAMENT_RESULTS_CHANNEL_ID is not set, the bot falls back to MEMBER_ALERTS_CHANNEL_ID,
+# then ADMIN_ALERTS_CHANNEL_ID, then the user's last known trade channel if available.
+AUTO_TOURNAMENT_RESULTS_ENABLED = os.getenv("AUTO_TOURNAMENT_RESULTS_ENABLED", "true").lower() == "true"
+TOURNAMENT_RESULTS_CHANNEL_ID = int(os.getenv("TOURNAMENT_RESULTS_CHANNEL_ID", "0"))
+TOURNAMENT_RESULTS_HOUR_PT = int(os.getenv("TOURNAMENT_RESULTS_HOUR_PT", "23"))
+TOURNAMENT_RESULTS_MINUTE_PT = int(os.getenv("TOURNAMENT_RESULTS_MINUTE_PT", "55"))
+
 # Only these channels will accept trade entries.
 # If both are 0, trade parsing is allowed in all channels.
 ADMIN_ALERTS_CHANNEL_ID = int(os.getenv("ADMIN_ALERTS_CHANNEL_ID", "0"))
@@ -70,6 +78,7 @@ trade_history = defaultdict(list)
 pending_deletes = {}
 last_trade_channels = {}
 tournament_players = {}
+tournament_meta = {}
 
 
 def clean_price_text(price_text: str) -> str:
@@ -409,7 +418,8 @@ def save_data():
         "trade_history": {},
         "pending_deletes": {},
         "last_trade_channels": {},
-        "tournament_players": {}
+        "tournament_players": {},
+        "tournament_meta": {}
     }
 
     # Convert positions, preserving Decimal values as strings
@@ -468,6 +478,8 @@ def save_data():
             "active": bool(value.get("active", True))
         }
 
+    data["tournament_meta"] = dict(tournament_meta)
+
     # Write atomically to temp file, then replace
     temp_file = f"{DATA_FILE}.tmp"
     try:
@@ -482,7 +494,7 @@ def save_data():
 
 def load_data():
     """Load data from JSON file, converting strings back to Decimal."""
-    global positions, trade_stats, user_stats, trade_history, pending_deletes, last_trade_channels, tournament_players
+    global positions, trade_stats, user_stats, trade_history, pending_deletes, last_trade_channels, tournament_players, tournament_meta
 
     if not os.path.exists(DATA_FILE):
         return
@@ -567,6 +579,8 @@ def load_data():
         }
         for user_id_str, value in data.get("tournament_players", {}).items()
     }
+
+    tournament_meta = dict(data.get("tournament_meta", {}))
 
 
 def log_trade(
@@ -989,6 +1003,32 @@ def _month_start_utc(now: datetime | None = None) -> datetime:
     return datetime(now.year, now.month, 1)
 
 
+def _month_bounds_utc_from_pt(now_pt: datetime | None = None) -> tuple[datetime, datetime, str]:
+    """Return UTC-naive month bounds based on Pacific calendar month.
+
+    Trade timestamps are stored as UTC-naive strings, but tournament months should
+    follow the server/business calendar in Pacific time.
+    """
+    now_pt = now_pt or datetime.now(PACIFIC_TZ)
+    start_pt = datetime(now_pt.year, now_pt.month, 1, tzinfo=PACIFIC_TZ)
+
+    if now_pt.month == 12:
+        next_start_pt = datetime(now_pt.year + 1, 1, 1, tzinfo=PACIFIC_TZ)
+    else:
+        next_start_pt = datetime(now_pt.year, now_pt.month + 1, 1, tzinfo=PACIFIC_TZ)
+
+    start_utc = start_pt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    end_utc = next_start_pt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    label = start_pt.strftime("%B %Y")
+    return start_utc, end_utc, label
+
+
+def _is_last_day_of_month_pt(now_pt: datetime | None = None) -> bool:
+    now_pt = now_pt or datetime.now(PACIFIC_TZ)
+    tomorrow = now_pt + timedelta(days=1)
+    return tomorrow.month != now_pt.month
+
+
 def _parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -998,13 +1038,19 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
         return None
 
 
-def _eligible_tournament_trades(user_id: int) -> list[dict]:
+def _eligible_tournament_trades(
+    user_id: int,
+    month_start: datetime | None = None,
+    month_end: datetime | None = None,
+) -> list[dict]:
     player = tournament_players.get(user_id)
     if not player or not player.get("active", True):
         return []
 
+    if month_start is None or month_end is None:
+        month_start, month_end, _ = _month_bounds_utc_from_pt()
+
     joined_at = _parse_iso_datetime(player.get("joined_at"))
-    month_start = _month_start_utc()
     start = max(joined_at, month_start) if joined_at else month_start
 
     trades = []
@@ -1017,13 +1063,17 @@ def _eligible_tournament_trades(user_id: int) -> list[dict]:
             trade_time = datetime.fromisoformat(trade["timestamp"])
         except Exception:
             continue
-        if trade_time >= start:
+        if start <= trade_time < month_end:
             trades.append(trade)
     return trades
 
 
-def _tournament_score(user_id: int) -> dict:
-    trades = _eligible_tournament_trades(user_id)
+def _tournament_score(
+    user_id: int,
+    month_start: datetime | None = None,
+    month_end: datetime | None = None,
+) -> dict:
+    trades = _eligible_tournament_trades(user_id, month_start, month_end)
     closed_trades = len(trades)
     score = Decimal("0.00")
     wins = losses = flat = 0
@@ -1054,15 +1104,131 @@ def _tournament_score(user_id: int) -> dict:
     }
 
 
-def _leaderboard_rows() -> list[tuple[int, dict]]:
+def _leaderboard_rows(
+    month_start: datetime | None = None,
+    month_end: datetime | None = None,
+) -> list[tuple[int, dict]]:
     rows = []
     for user_id, player in tournament_players.items():
         if not player.get("active", True):
             continue
-        stats = _tournament_score(user_id)
+        stats = _tournament_score(user_id, month_start, month_end)
         rows.append((user_id, stats))
     rows.sort(key=lambda row: (row[1]["qualified"], row[1]["score"], row[1]["closed_trades"]), reverse=True)
     return rows
+
+
+def _resolve_tournament_results_channel():
+    channel_id = (
+        TOURNAMENT_RESULTS_CHANNEL_ID
+        or MEMBER_ALERTS_CHANNEL_ID
+        or ADMIN_ALERTS_CHANNEL_ID
+    )
+    if channel_id:
+        ch = bot.get_channel(int(channel_id))
+        if ch is not None:
+            return ch
+
+    for channel_id in last_trade_channels.values():
+        ch = bot.get_channel(int(channel_id))
+        if ch is not None:
+            return ch
+
+    return None
+
+
+def _build_monthly_results_embed(month_start: datetime, month_end: datetime, month_label: str) -> discord.Embed:
+    rows = _leaderboard_rows(month_start, month_end)
+    qualified = [(uid, stats) for uid, stats in rows if stats["qualified"]]
+
+    if not rows:
+        return discord.Embed(
+            title=f"🏆 BLACKOUT Monthly Results — {month_label}",
+            description="No tournament participants joined this month.",
+            color=discord.Color.dark_grey(),
+        )
+
+    medal = ["🥇", "🥈", "🥉"]
+    lines = []
+
+    if qualified:
+        for idx, (user_id, stats) in enumerate(qualified[:10], start=1):
+            user = bot.get_user(user_id)
+            name = user.display_name if user else f"User {user_id}"
+            prefix = medal[idx - 1] if idx <= 3 else f"#{idx}"
+            prize_note = " 🏆" if idx <= 3 else ""
+            lines.append(
+                f"{prefix} **{name}** — **{fmt_pct(stats['score'])}** "
+                f"| {stats['closed_trades']} closed | Win Rate {stats['win_rate']:.1f}%{prize_note}"
+            )
+    else:
+        lines.append("No traders met the minimum closed-trade requirement this month.")
+        lines.append("")
+        lines.append("**Top activity:**")
+        for idx, (user_id, stats) in enumerate(rows[:5], start=1):
+            user = bot.get_user(user_id)
+            name = user.display_name if user else f"User {user_id}"
+            lines.append(
+                f"#{idx} **{name}** — {fmt_pct(stats['score'])} "
+                f"| {stats['closed_trades']} closed"
+            )
+
+    embed = discord.Embed(
+        title=f"🏆 BLACKOUT Monthly Results — {month_label}",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(
+        text=f"Minimum {TOURNAMENT_MIN_CLOSED_TRADES} closed trades to qualify · New month starts after reset"
+    )
+    return embed
+
+
+async def post_monthly_tournament_results_once(month_start: datetime, month_end: datetime, month_label: str) -> bool:
+    channel = _resolve_tournament_results_channel()
+    if channel is None:
+        print("[tournament] no results channel found")
+        return False
+
+    embed = _build_monthly_results_embed(month_start, month_end, month_label)
+    await channel.send(embed=embed)
+    print(f"[tournament] monthly results posted for {month_label} → #{channel.name}")
+    return True
+
+
+async def tournament_results_task_loop():
+    """Post final monthly winners on the last calendar day at configured PT time."""
+    await bot.wait_until_ready()
+
+    print(
+        f"[tournament] auto-results "
+        f"{TOURNAMENT_RESULTS_HOUR_PT:02d}:{TOURNAMENT_RESULTS_MINUTE_PT:02d} PT "
+        f"| enabled={AUTO_TOURNAMENT_RESULTS_ENABLED}"
+    )
+
+    while not bot.is_closed():
+        now_pt = datetime.now(PACIFIC_TZ)
+        month_start, month_end, month_label = _month_bounds_utc_from_pt(now_pt)
+        month_key = now_pt.strftime("%Y-%m")
+
+        should_post = (
+            AUTO_TOURNAMENT_RESULTS_ENABLED
+            and _is_last_day_of_month_pt(now_pt)
+            and now_pt.hour == TOURNAMENT_RESULTS_HOUR_PT
+            and now_pt.minute == TOURNAMENT_RESULTS_MINUTE_PT
+            and tournament_meta.get("last_results_month") != month_key
+        )
+
+        if should_post:
+            try:
+                posted = await post_monthly_tournament_results_once(month_start, month_end, month_label)
+                if posted:
+                    tournament_meta["last_results_month"] = month_key
+                    save_data()
+            except Exception as e:
+                print(f"[tournament] monthly results post failed: {e!r}")
+
+        await asyncio.sleep(30)
 
 
 @bot.command(name="help")
@@ -1116,6 +1282,20 @@ async def help_command(ctx):
 
 @bot.command(name="join")
 async def join_command(ctx):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    ET = ZoneInfo("America/New_York")
+    now = datetime.now(ET)
+
+    # Registration closes after the 2nd day of the month
+    if now.day > 2:
+        await ctx.send(
+            "❌ Tournament registration is closed for this month.\n"
+            "Registration opens again at month end."
+        )
+        return
+
     user_id = ctx.author.id
     if user_id in tournament_players and tournament_players[user_id].get("active", True):
         joined_at = tournament_players[user_id].get("joined_at", "already joined")
@@ -1144,7 +1324,7 @@ async def join_command(ctx):
 
 @bot.command(name="tournament")
 async def tournament_command(ctx):
-    month_label = datetime.utcnow().strftime("%B %Y")
+    _, _, month_label = _month_bounds_utc_from_pt()
     embed = discord.Embed(
         title=f"🏆 BLACKOUT Monthly Tournament — {month_label}",
         description=(
@@ -1170,7 +1350,7 @@ async def tournament_command(ctx):
 @bot.command(name="leaderboard", aliases=["lb"])
 async def leaderboard_command(ctx):
     rows = _leaderboard_rows()
-    month_label = datetime.utcnow().strftime("%B %Y")
+    _, _, month_label = _month_bounds_utc_from_pt()
 
     if not rows:
         await ctx.send("No one has joined the tournament yet. Type `!join` to enter.")
@@ -1582,6 +1762,10 @@ async def on_ready():
         bot.eod_task_started = True
         bot.loop.create_task(end_of_day_task_loop())
 
+    if not hasattr(bot, "tournament_results_task_started"):
+        bot.tournament_results_task_started = True
+        bot.loop.create_task(tournament_results_task_loop())
+
 
 async def process_trade_message(message):
     """Parse a message as a trade and post the embed.
@@ -1601,6 +1785,18 @@ async def process_trade_message(message):
     ticker = ticker.upper().strip()
     strike = strike.upper().strip()
     expiry = expiry.strip()
+
+    # Block users from opening already-expired contracts.
+    # Same-day 0DTE trades are still allowed.
+    expiry_date = parse_expiry_date_pt(expiry)
+    today_pt = datetime.now(PACIFIC_TZ).date()
+
+    if action in ["BTO", "STO"] and expiry_date is not None and expiry_date < today_pt:
+        await message.channel.send(
+            f"❌ Cannot open expired contract: {ticker} {strike} {expiry}.",
+            delete_after=8,
+        )
+        return True
 
     # Remember where this user trades so EOD alerts post in the same channel.
     last_trade_channels[message.author.id] = message.channel.id
