@@ -42,9 +42,9 @@ TOURNAMENT_RESULTS_CHANNEL_ID = int(os.getenv("TOURNAMENT_RESULTS_CHANNEL_ID", "
 TOURNAMENT_RESULTS_HOUR_PT = int(os.getenv("TOURNAMENT_RESULTS_HOUR_PT", "23"))
 TOURNAMENT_RESULTS_MINUTE_PT = int(os.getenv("TOURNAMENT_RESULTS_MINUTE_PT", "55"))
 
-# Registration announcement at 25th of each month
+# Registration announcement daily during registration window (25th-2nd)
 REGISTRATION_ANNOUNCEMENT_ENABLED = os.getenv("REGISTRATION_ANNOUNCEMENT_ENABLED", "true").lower() == "true"
-REGISTRATION_ANNOUNCEMENT_HOUR_PT = int(os.getenv("REGISTRATION_ANNOUNCEMENT_HOUR_PT", "9"))
+REGISTRATION_ANNOUNCEMENT_HOUR_PT = int(os.getenv("REGISTRATION_ANNOUNCEMENT_HOUR_PT", "12"))
 REGISTRATION_ANNOUNCEMENT_MINUTE_PT = int(os.getenv("REGISTRATION_ANNOUNCEMENT_MINUTE_PT", "0"))
 
 # Only these channels will accept trade entries.
@@ -1277,12 +1277,12 @@ async def announce_registration_window_once() -> bool:
 
 
 async def registration_announcement_task_loop():
-    """Announce registration window on the 25th of each month."""
+    """Announce registration window daily during the registration period (25th-2nd)."""
     await bot.wait_until_ready()
 
     print(
         f"[registration-announce] enabled={REGISTRATION_ANNOUNCEMENT_ENABLED} "
-        f"time={REGISTRATION_ANNOUNCEMENT_HOUR_PT:02d}:{REGISTRATION_ANNOUNCEMENT_MINUTE_PT:02d} PT"
+        f"daily during registration window (25th-2nd) at {REGISTRATION_ANNOUNCEMENT_HOUR_PT:02d}:{REGISTRATION_ANNOUNCEMENT_MINUTE_PT:02d} PT"
     )
 
     last_announcement_date = None
@@ -1291,9 +1291,12 @@ async def registration_announcement_task_loop():
         now_pt = datetime.now(PACIFIC_TZ)
         today_key = now_pt.strftime("%Y-%m-%d")
 
+        # Registration window is 25th-31st and 1st-2nd
+        in_registration_window = now_pt.day >= 25 or now_pt.day <= 2
+
         if (
             REGISTRATION_ANNOUNCEMENT_ENABLED
-            and now_pt.day == 25
+            and in_registration_window
             and now_pt.hour == REGISTRATION_ANNOUNCEMENT_HOUR_PT
             and now_pt.minute == REGISTRATION_ANNOUNCEMENT_MINUTE_PT
             and last_announcement_date != today_key
