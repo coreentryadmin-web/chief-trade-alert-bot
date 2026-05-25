@@ -1288,8 +1288,11 @@ async def join_command(ctx):
     ET = ZoneInfo("America/New_York")
     now = datetime.now(ET)
 
-    # Registration closes after the 2nd day of the month
-    if now.day > 2:
+    # Opens on 25th of current month
+    # Closes after the 2nd of next month
+
+    if not (now.day >= 25 or now.day <= 2):
+        
         await ctx.send(
             "❌ Tournament registration is closed for this month.\n"
             "Registration opens again at month end."
