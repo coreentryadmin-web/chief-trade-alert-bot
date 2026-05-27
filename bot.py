@@ -54,8 +54,17 @@ REGISTRATION_ANNOUNCEMENT_MINUTE_PT = int(os.getenv("REGISTRATION_ANNOUNCEMENT_M
 # If both are 0, trade parsing is allowed in all channels.
 ADMIN_ALERTS_CHANNEL_ID = int(os.getenv("ADMIN_ALERTS_CHANNEL_ID", "0"))
 MEMBER_ALERTS_CHANNEL_ID = int(os.getenv("MEMBER_ALERTS_CHANNEL_ID", "0"))
+VIP_ALERTS_CHANNEL_ID = int(os.getenv("VIP_ALERTS_CHANNEL_ID", "0"))
+SWING_ALERTS_CHANNEL_ID = int(os.getenv("SWING_ALERTS_CHANNEL_ID", "0"))
+LEAP_ALERTS_CHANNEL_ID = int(os.getenv("LEAP_ALERTS_CHANNEL_ID", "0"))
 ALLOWED_TRADE_CHANNEL_IDS = {
-    cid for cid in (ADMIN_ALERTS_CHANNEL_ID, MEMBER_ALERTS_CHANNEL_ID) if cid
+   cid for cid in (
+        ADMIN_ALERTS_CHANNEL_ID,
+        MEMBER_ALERTS_CHANNEL_ID,
+        VIP_ALERTS_CHANNEL_ID,
+        SWING_ALERTS_CHANNEL_ID,
+        LEAP_ALERTS_CHANNEL_ID,
+    ) if cid
 }
 
 intents = discord.Intents.default()
