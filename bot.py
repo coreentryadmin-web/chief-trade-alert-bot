@@ -3,7 +3,6 @@ import re
 import json
 import time
 import asyncio
-import aiohttp
 import discord
 from discord.ext import commands
 from collections import defaultdict
