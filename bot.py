@@ -118,7 +118,7 @@ def is_market_price(price_text: str) -> bool:
 
 
 def parse_expiry_to_iso(expiry: str) -> str:
-    """Convert M/D, M/D/YY, or M/D/YYYY into YYYY-MM-DD for UW API."""
+    """Convert M/D, M/D/YY, or M/D/YYYY into YYYY-MM-DD."""
     raw = str(expiry or "").strip()
     parts = raw.split("/")
     if len(parts) not in (2, 3):
@@ -143,167 +143,6 @@ def parse_expiry_to_iso(expiry: str) -> str:
     return datetime(year, month, day).date().isoformat()
 
 
-def _option_side_from_strike(strike_text: str) -> tuple[Decimal, str]:
-    """Parse 110c / 110p into (Decimal('110'), 'call'/'put')."""
-    raw = str(strike_text or "").strip().lower()
-    side_char = raw[-1]
-    strike_num = Decimal(raw[:-1])
-    side = "call" if side_char == "c" else "put"
-    return strike_num, side
-
-
-def _to_decimal_or_none(value):
-    if value is None or value == "":
-        return None
-    try:
-        d = Decimal(str(value).replace(",", "").strip())
-        if d <= 0:
-            return None
-        return d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    except Exception:
-        return None
-
-
-def _row_option_type(row: dict) -> str:
-    value = str(
-        row.get("option_type")
-        or row.get("type")
-        or row.get("call_put")
-        or row.get("side")
-        or ""
-    ).lower()
-    if value in ("c", "call", "calls"):
-        return "call"
-    if value in ("p", "put", "puts"):
-        return "put"
-
-    symbol = str(
-        row.get("option_symbol")
-        or row.get("option_chain")
-        or row.get("option_chain_id")
-        or row.get("chain")
-        or ""
-    ).upper()
-    # OCC tail usually includes C/P before strike digits.
-    m = re.search(r"\d{6}([CP])\d{8}$", symbol)
-    if m:
-        return "call" if m.group(1) == "C" else "put"
-    return ""
-
-
-def _row_strike(row: dict) -> Decimal | None:
-    strike = _to_decimal_or_none(row.get("strike"))
-    if strike is not None:
-        return strike
-
-    symbol = str(
-        row.get("option_symbol")
-        or row.get("option_chain")
-        or row.get("option_chain_id")
-        or row.get("chain")
-        or ""
-    ).upper()
-    m = re.search(r"\d{6}[CP](\d{8})$", symbol)
-    if not m:
-        return None
-    try:
-        return (Decimal(int(m.group(1))) / Decimal("1000")).quantize(Decimal("0.001"))
-    except Exception:
-        return None
-
-
-def _pick_contract_price(row: dict, action: str) -> tuple[Decimal | None, str]:
-    """Pick a practical market price from UW contract row.
-
-    For closes:
-      STC = sell to close, prefer bid.
-      BTC = buy to close, prefer ask.
-    For opens:
-      BTO = buy to open, prefer ask.
-      STO = sell to open, prefer bid.
-    Then fallback to mid/mark/last-style fields.
-    """
-    action = action.upper()
-    bid_keys = ("bid", "bid_price", "nbbo_bid", "best_bid")
-    ask_keys = ("ask", "ask_price", "nbbo_ask", "best_ask")
-    mid_keys = ("mid", "mark", "mark_price", "mid_price")
-    last_keys = ("last", "last_price", "price", "close", "close_price")
-
-    def first(keys):
-        for key in keys:
-            d = _to_decimal_or_none(row.get(key))
-            if d is not None:
-                return d, key
-        return None, ""
-
-    if action in ("STC", "STO"):
-        d, key = first(bid_keys)
-        if d is not None:
-            return d, key
-    elif action in ("BTC", "BTO"):
-        d, key = first(ask_keys)
-        if d is not None:
-            return d, key
-
-    # Fallback: calculate midpoint from bid/ask if both exist.
-    bid, _ = first(bid_keys)
-    ask, _ = first(ask_keys)
-    if bid is not None and ask is not None:
-        return ((bid + ask) / Decimal("2")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "mid(bid/ask)"
-
-    for keys in (mid_keys, last_keys, bid_keys, ask_keys):
-        d, key = first(keys)
-        if d is not None:
-            return d, key
-
-    return None, ""
-
-
-async def fetch_uw_market_option_price(action: str, ticker: str, strike: str, expiry: str) -> tuple[Decimal, str]:
-    """Fetch a market option price from UW option contracts for @m.
-
-    Returns (price, source_field). Raises RuntimeError if price cannot be found.
-    """
-    if not UW_API_KEY:
-        raise RuntimeError("UW_API_KEY is not set. Add it in Railway or enter a manual price.")
-
-    expiry_iso = parse_expiry_to_iso(expiry)
-    target_strike, target_side = _option_side_from_strike(strike)
-
-    url = f"{UW_API_BASE}/api/stock/{ticker.upper()}/option-contracts"
-    headers = {"Authorization": f"Bearer {UW_API_KEY}"}
-    params = {"expiry": expiry_iso, "limit": "500"}
-
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers, params=params) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"UW option-contracts returned {resp.status}: {body[:160]}")
-            payload = await resp.json()
-
-    rows = list(payload.get("data") or [])
-    if not rows:
-        raise RuntimeError(f"No UW option contracts found for {ticker.upper()} {expiry_iso}.")
-
-    matched = []
-    for row in rows:
-        row_strike = _row_strike(row)
-        row_side = _row_option_type(row)
-        if row_strike is None or not row_side:
-            continue
-        if row_side == target_side and row_strike == target_strike:
-            matched.append(row)
-
-    if not matched:
-        raise RuntimeError(f"No matching UW contract found for {ticker.upper()} {strike.upper()} {expiry_iso}.")
-
-    for row in matched:
-        price, source = _pick_contract_price(row, action)
-        if price is not None:
-            return price, source
-
-    raise RuntimeError(f"UW contract found, but no usable bid/ask/mark/last price for {ticker.upper()} {strike.upper()} {expiry_iso}.")
 
 def fmt_money(value) -> str:
     """Format Decimal value as money string."""
@@ -360,7 +199,7 @@ def get_format_help_message(message_text: str) -> str:
         return (
             "❌ Invalid trade format.\n"
             "Examples:\n"
-            "`bto spx 7130c 5/15 @m`\n"
+            "`bto spx 7130c 5/15 @ 1.25`\n"
             "`bto 5 spx 7130c 5/15 @ 1.25`\n"
             "Use: `[action] [qty optional] [ticker] [strike][c/p] [expiry] @ [price]`"
         )
@@ -372,7 +211,7 @@ def get_format_help_message(message_text: str) -> str:
         return (
             "❌ Invalid trade format.\n"
             "Examples:\n"
-            "`bto spx 7130c 5/15 @m`\n"
+            "`bto spx 7130c 5/15 @ 1.25`\n"
             "`bto 5 spx 7130c 5/15 @ 1.25`\n"
             "Use: `[action] [qty optional] [ticker] [strike][c/p] [expiry] @ [price]`"
         )
@@ -385,7 +224,7 @@ def get_format_help_message(message_text: str) -> str:
         return (
             "❌ Missing fields.\n"
             "Examples:\n"
-            "`bto spx 7130c 5/15 @m`\n"
+            "`bto spx 7130c 5/15 @ 1.25`\n"
             "`bto 5 spx 7130c 5/15 @ 1.25`"
         )
 
@@ -400,9 +239,9 @@ def get_format_help_message(message_text: str) -> str:
     return (
         "❌ Invalid trade format.\n"
         "Examples:\n"
-        "`bto spx 7130c 5/15 @m`\n"
+        "`bto spx 7130c 5/15 @ 1.25`\n"
         "`bto 5 spx 7130c 5/15 @ 1.25`\n"
-        "You can use `@m` for market price."
+        "`@m` is currently disabled. Use manual prices like `@ 1.25`."
     )
 
 
@@ -442,7 +281,8 @@ def save_data():
         data["positions"][key_str] = [
             {
                 "qty": lot["qty"],
-                "entry_price": str(lot["entry_price"]) if lot["entry_price"] is not None else None
+                "entry_price": str(lot["entry_price"]) if lot["entry_price"] is not None else None,
+                "opened_at": lot.get("opened_at")
             }
             for lot in lots
         ]
@@ -474,7 +314,9 @@ def save_data():
                 "expiry": trade["expiry"],
                 "price_text": trade["price_text"],
                 "total_pnl": str(trade["total_pnl"]) if trade["total_pnl"] is not None else None,
-                "pnl_pct": float(trade["pnl_pct"]) if trade["pnl_pct"] is not None else None
+                "pnl_pct": float(trade["pnl_pct"]) if trade["pnl_pct"] is not None else None,
+                "opened_at": trade.get("opened_at"),
+                "matched_opened_at": trade.get("matched_opened_at", [])
             }
             for trade in history
         ]
@@ -527,7 +369,8 @@ def load_data():
         for lot in lots:
             loaded_lots.append({
                 "qty": lot["qty"],
-                "entry_price": Decimal(lot["entry_price"]) if lot["entry_price"] is not None else None
+                "entry_price": Decimal(lot["entry_price"]) if lot["entry_price"] is not None else None,
+                "opened_at": lot.get("opened_at")
             })
         loaded_positions[str_to_contract_key(key_str)] = loaded_lots
     positions = loaded_positions
@@ -572,7 +415,9 @@ def load_data():
                 "expiry": trade["expiry"],
                 "price_text": trade["price_text"],
                 "total_pnl": Decimal(trade["total_pnl"]) if trade["total_pnl"] is not None else None,
-                "pnl_pct": Decimal(str(trade["pnl_pct"])) if trade["pnl_pct"] is not None else None
+                "pnl_pct": Decimal(str(trade["pnl_pct"])) if trade["pnl_pct"] is not None else None,
+                "opened_at": trade.get("opened_at"),
+                "matched_opened_at": trade.get("matched_opened_at", [])
             })
         loaded_trade_history[int(user_id_str)] = loaded_trades
     trade_history = loaded_trade_history
@@ -608,7 +453,9 @@ def log_trade(
     expiry,
     price_text,
     total_pnl=None,
-    pnl_pct=None
+    pnl_pct=None,
+    opened_at=None,
+    matched_opened_at=None
 ):
     """Log a trade to history."""
     trade_history[user_id].append({
@@ -620,7 +467,9 @@ def log_trade(
         "expiry": expiry,
         "price_text": clean_price_text(price_text),
         "total_pnl": total_pnl,
-        "pnl_pct": pnl_pct
+        "pnl_pct": pnl_pct,
+        "opened_at": opened_at,
+        "matched_opened_at": matched_opened_at or []
     })
 
 
@@ -629,7 +478,8 @@ def add_open_position(user_id, ticker, strike, expiry, side, qty, entry_price):
     key = contract_key(user_id, ticker, strike, expiry, side)
     positions[key].append({
         "qty": qty,
-        "entry_price": entry_price  # Will be Decimal or None
+        "entry_price": entry_price,  # Will be Decimal or None
+        "opened_at": datetime.utcnow().isoformat()
     })
     trade_stats[key]["opened_qty"] += qty
     user_stats[user_id]["opened_qty"] += qty
@@ -673,6 +523,8 @@ def close_position(user_id, ticker, strike, expiry, side, close_qty, exit_price)
             "previous_closed_qty": previous_closed_qty,
             "total_closed_overall": previous_closed_qty,
             "total_opened_overall": total_opened_overall,
+            "opened_at": None,
+            "matched_opened_at": [],
             "error_message": "No open position found."
         }
 
@@ -683,6 +535,7 @@ def close_position(user_id, ticker, strike, expiry, side, close_qty, exit_price)
     total_entry_value = Decimal('0.00')
     total_pnl = Decimal('0.00')
     pnl_available = True
+    matched_opened_at_values = []
 
     i = 0
     while i < len(opens) and remaining_to_close > 0:
@@ -694,6 +547,10 @@ def close_position(user_id, ticker, strike, expiry, side, close_qty, exit_price)
 
         matched_qty += qty_used
         remaining_to_close -= qty_used
+
+        lot_opened_at = lot.get("opened_at")
+        if lot_opened_at:
+            matched_opened_at_values.append(lot_opened_at)
 
         if lot_entry is None or exit_price is None:
             pnl_available = False
@@ -775,6 +632,8 @@ def close_position(user_id, ticker, strike, expiry, side, close_qty, exit_price)
         "previous_closed_qty": previous_closed_qty,
         "total_closed_overall": total_closed_overall,
         "total_opened_overall": total_opened_overall,
+        "opened_at": matched_opened_at_values[0] if matched_opened_at_values else None,
+        "matched_opened_at": matched_opened_at_values,
         "error_message": error_message
     }
 
@@ -828,7 +687,7 @@ def find_user_ticker_positions(user_id, ticker):
 
 
 def parse_expiry_date_pt(expiry: str):
-    """Return expiry date object using the same logic as UW expiry parsing."""
+    """Return expiry date object using the same expiry parsing logic."""
     try:
         return datetime.fromisoformat(parse_expiry_to_iso(expiry)).date()
     except Exception:
@@ -903,6 +762,8 @@ async def auto_expire_positions_once() -> int:
             price_text="0.00",
             total_pnl=result["total_pnl"],
             pnl_pct=result["pnl_pct"],
+            opened_at=result.get("opened_at"),
+            matched_opened_at=result.get("matched_opened_at", [])
         )
         save_data()
         expired_count += 1
@@ -1059,6 +920,15 @@ def _eligible_tournament_trades(
     month_start: datetime | None = None,
     month_end: datetime | None = None,
 ) -> list[dict]:
+    """Closed tournament trades eligible for scoring.
+
+    Rules:
+    - User must be registered and active.
+    - Only STC/BTC closes count.
+    - Close timestamp must be inside the tournament month.
+    - The matched opening lot(s) must also have been opened inside the same month.
+    - Old carried runners from a prior month do not count in the new month.
+    """
     player = tournament_players.get(user_id)
     if not player or not player.get("active", True):
         return []
@@ -1074,12 +944,32 @@ def _eligible_tournament_trades(
             continue
         if trade.get("pnl_pct") is None:
             continue
-        try:
-            trade_time = datetime.fromisoformat(trade["timestamp"])
-        except Exception:
+
+        trade_time = _parse_iso_datetime(trade.get("timestamp"))
+        if trade_time is None or not (month_start <= trade_time < month_end):
             continue
-        if month_start <= trade_time < month_end:
-            trades.append(trade)
+
+        matched_opened_at = trade.get("matched_opened_at") or []
+        if not matched_opened_at and trade.get("opened_at"):
+            matched_opened_at = [trade.get("opened_at")]
+
+        # New tournament rule: the opening lot must also belong to this same month.
+        # Old records with no opened_at are intentionally excluded from scoring.
+        if not matched_opened_at:
+            continue
+
+        all_opened_in_month = True
+        for opened_at_raw in matched_opened_at:
+            opened_at = _parse_iso_datetime(opened_at_raw)
+            if opened_at is None or not (month_start <= opened_at < month_end):
+                all_opened_in_month = False
+                break
+
+        if not all_opened_in_month:
+            continue
+
+        trades.append(trade)
+
     return trades
 
 
@@ -1090,7 +980,7 @@ def _tournament_score(
 ) -> dict:
     trades = _eligible_tournament_trades(user_id, month_start, month_end)
     closed_trades = len(trades)
-    score = Decimal("0.00")
+    best_trade_pct = None
     wins = losses = flat = 0
 
     for trade in trades:
@@ -1098,7 +988,10 @@ def _tournament_score(
         # Only apply cap if TOURNAMENT_MAX_GAIN_PER_TRADE > 0 (0 or negative = no cap)
         if TOURNAMENT_MAX_GAIN_PER_TRADE > 0 and pct > TOURNAMENT_MAX_GAIN_PER_TRADE:
             pct = TOURNAMENT_MAX_GAIN_PER_TRADE
-        score += pct
+
+        if best_trade_pct is None or pct > best_trade_pct:
+            best_trade_pct = pct
+
         if pct > 0:
             wins += 1
         elif pct < 0:
@@ -1106,6 +999,7 @@ def _tournament_score(
         else:
             flat += 1
 
+    score = best_trade_pct if best_trade_pct is not None else Decimal("0.00")
     decided = wins + losses
     win_rate = (wins / decided * 100) if decided else 0.0
 
@@ -1339,8 +1233,8 @@ async def help_command(ctx):
             "`bto spy 590c 5/16 @ 1.25`\n"
             "`bto 5 spy 590c 5/16 @ 1.25`\n"
             "`stc spy 590c 5/16 @ 2.10`\n"
-            "`bto spx 7130c 5/15 @m`\n\n"
-            "`@m` = market price using UW option contract data."
+            "`bto spx 7130c 5/15 @ 1.25`\n\n"
+            "`@m` is disabled. Please enter a manual price like `@ 1.25`."
         ),
         color=discord.Color.blurple(),
     )
@@ -1492,7 +1386,8 @@ async def tournament_command(ctx):
             "**Scoring**\n"
             "• Only bot-logged trades count\n"
             "• Only closed trades count\n"
-            "• Score = sum of closed trade % gains for the month\n"
+            "• Score = highest single realized trade % for the month\n"
+            "• Trade must be opened and closed in the same tournament month\n"
             f"• Minimum `{TOURNAMENT_MIN_CLOSED_TRADES}` closed trades required to qualify\n"
             f"• Max gain per trade: {max_gain_text}\n\n"
             "**Commands**\n"
@@ -1988,29 +1883,16 @@ async def process_trade_message(message):
     last_trade_channels[message.author.id] = message.channel.id
 
     numeric_price = parse_price(price_text)
-    market_source = None
 
     if is_market_price(price_text):
-        try:
-            numeric_price, market_source = await fetch_uw_market_option_price(
-                action=action,
-                ticker=ticker,
-                strike=strike,
-                expiry=expiry,
-            )
-        except Exception as e:
-            await message.channel.send(
-                f"❌ Could not fetch UW market price for {ticker} {strike} {expiry}: {e}",
-                delete_after=10,
-            )
-            return True
+        await message.channel.send(
+            "❌ Market price `@m` is disabled. Please enter a manual price like `@ 1.25`.",
+            delete_after=10,
+        )
+        return True
 
-    if is_market_price(price_text) and numeric_price is not None:
-        display_price = f"Market (${numeric_price})"
-        price_text_for_log = str(numeric_price)
-    else:
-        display_price = fmt_price_text(price_text)
-        price_text_for_log = price_text
+    display_price = fmt_price_text(price_text)
+    price_text_for_log = price_text
 
     color = get_color(action)
 
@@ -2096,7 +1978,9 @@ async def process_trade_message(message):
             expiry=expiry,
             price_text=price_text_for_log,
             total_pnl=total_pnl,
-            pnl_pct=pnl_pct
+            pnl_pct=pnl_pct,
+            opened_at=result.get("opened_at"),
+            matched_opened_at=result.get("matched_opened_at", [])
         )
         save_data()
 
