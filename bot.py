@@ -103,8 +103,6 @@ def clean_price_text(price_text: str) -> str:
 def parse_price(price_text: str):
     """Parse price text to Decimal or None for market price."""
     price_text = clean_price_text(price_text)
-    if price_text == "m":
-        return None
     try:
         return Decimal(price_text).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     except:
@@ -163,16 +161,12 @@ def fmt_pct(value) -> str:
 def fmt_price_text(price_text: str) -> str:
     """Format price for display in embeds."""
     price_text = clean_price_text(price_text)
-    if price_text == "m":
-        return "Market Price"
     return f"${price_text}"
 
 
 def fmt_price_short(price_text: str) -> str:
     """Format price for compact display."""
     price_text = clean_price_text(price_text)
-    if price_text == "m":
-        return "MKT"
     return f"${price_text}"
 
 
@@ -875,10 +869,6 @@ async def end_of_day_task_loop():
 
 # ---------- Help + Tournament Commands ----------
 
-def _month_start_utc(now: datetime | None = None) -> datetime:
-    now = now or datetime.utcnow()
-    return datetime(now.year, now.month, 1)
-
 
 def _month_bounds_utc_from_pt(now_pt: datetime | None = None) -> tuple[datetime, datetime, str]:
     """Return UTC-naive month bounds based on Pacific calendar month.
@@ -1175,7 +1165,8 @@ async def announce_registration_window_once() -> bool:
             f"• Trades count from the 1st to the last day of {month_label.split()[0]}\n"
             f"• Only closed trades count toward your score\n"
             f"• Minimum {TOURNAMENT_MIN_CLOSED_TRADES} closed trades required to qualify\n"
-            f"• Score = sum of all closed trade % gains\n"
+            f"• Score = highest single realized trade % gain\n"
+            f"• Trades must be **opened and closed in the same month** to count.\n"
             f"{max_gain_line}\n"
             f"Type `!tournament` for full rules and scoring details."
         ),
@@ -1460,7 +1451,8 @@ async def rank_command(ctx):
     rows = _leaderboard_rows(effective_month=effective_month)
     rank = next((i for i, (uid, _) in enumerate(rows, start=1) if uid == user_id), None)
     
-    stats = _tournament_score(user_id)
+    month_start, month_end, _ = _month_bounds_utc_from_effective_month(effective_month)
+    stats = _tournament_score(user_id, month_start, month_end)
     needed = max(0, TOURNAMENT_MIN_CLOSED_TRADES - stats["closed_trades"])
     
     month_label = _month_bounds_utc_from_effective_month(effective_month)[2]
@@ -1879,11 +1871,8 @@ async def process_trade_message(message):
         )
         return True
 
-    # Remember where this user trades so EOD alerts post in the same channel.
-    last_trade_channels[message.author.id] = message.channel.id
-
-    numeric_price = parse_price(price_text)
-
+    # FIX 1: Block @m BEFORE recording the channel. A rejected trade should not
+    # cause the user to receive EOD alerts or auto-expire notices.
     if is_market_price(price_text):
         await message.channel.send(
             "❌ Market price `@m` is disabled. Please enter a manual price like `@ 1.25`.",
@@ -1891,15 +1880,40 @@ async def process_trade_message(message):
         )
         return True
 
+    # FIX 4: Validate that the price parsed successfully before proceeding.
+    # parse_price() returns None for @m (already blocked above) and also for
+    # any malformed value that slips past the regex — guard against that here.
+    numeric_price = parse_price(price_text)
+    if numeric_price is None:
+        await message.channel.send(
+            f"❌ Invalid price `{price_text}`. Please enter a numeric price like `@ 1.25`.",
+            delete_after=10,
+        )
+        return True
+
+    # Only record the channel on a trade we're actually going to process.
+    last_trade_channels[message.author.id] = message.channel.id
+
     display_price = fmt_price_text(price_text)
     price_text_for_log = price_text
 
     color = get_color(action)
-
     title = f"{ticker} {strike} {expiry}"
 
     if action in ["BTO", "STO"]:
         side = "LONG" if action == "BTO" else "SHORT"
+
+        # FIX 2: Open the position BEFORE logging it. If add_open_position ever
+        # raises, we won't have a dangling history entry with no matching position.
+        add_open_position(
+            user_id=message.author.id,
+            ticker=ticker,
+            strike=strike,
+            expiry=expiry,
+            side=side,
+            qty=qty,
+            entry_price=numeric_price
+        )
 
         log_trade(
             user_id=message.author.id,
@@ -1913,15 +1927,6 @@ async def process_trade_message(message):
             pnl_pct=None
         )
 
-        add_open_position(
-            user_id=message.author.id,
-            ticker=ticker,
-            strike=strike,
-            expiry=expiry,
-            side=side,
-            qty=qty,
-            entry_price=numeric_price
-        )
         save_data()
 
         label = "Opened" if action == "BTO" else "Sold to Open"
@@ -1965,14 +1970,22 @@ async def process_trade_message(message):
                 f"❌ No open position found for {ticker} {strike} {expiry}",
                 delete_after=5
             )
-            # Pattern matched, just nothing to close against — return True so the
-            # caller doesn't ALSO post the format-help reply.
             return True
+
+        # FIX 3: Warn the user when they requested more contracts than were open.
+        # The close still proceeds for the matched quantity — we just surface the
+        # mismatch so they know not all of their requested qty was filled.
+        if matched_qty < qty:
+            await message.channel.send(
+                f"⚠️ Only {matched_qty} of {qty} requested contracts were open for "
+                f"{ticker} {strike} {expiry}. Closed {matched_qty}.",
+                delete_after=12,
+            )
 
         log_trade(
             user_id=message.author.id,
             action=action,
-            qty=qty,
+            qty=matched_qty,
             ticker=ticker,
             strike=strike,
             expiry=expiry,
@@ -2007,7 +2020,6 @@ async def process_trade_message(message):
             remaining_entry_text = (
                 f"${remaining_entry_price}" if remaining_entry_price is not None else "Unknown"
             )
-
             partial_block = (
                 f"Closed: {matched_qty}/{total_open_before_close} ({closed_pct:.0f}%)\n"
                 f"Remaining: {remaining_after_close} @ {remaining_entry_text}"
@@ -2054,7 +2066,6 @@ async def process_trade_message(message):
         print(f"Failed to send embed: {e}")
 
     return True
-
 
 @bot.event
 async def on_message(message):
