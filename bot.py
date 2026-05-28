@@ -103,6 +103,8 @@ def clean_price_text(price_text: str) -> str:
 def parse_price(price_text: str):
     """Parse price text to Decimal or None for market price."""
     price_text = clean_price_text(price_text)
+    if price_text == "m":
+        return None
     try:
         return Decimal(price_text).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
     except:
@@ -971,6 +973,7 @@ def _tournament_score(
     trades = _eligible_tournament_trades(user_id, month_start, month_end)
     closed_trades = len(trades)
     best_trade_pct = None
+    best_trade = None
     wins = losses = flat = 0
 
     for trade in trades:
@@ -981,6 +984,7 @@ def _tournament_score(
 
         if best_trade_pct is None or pct > best_trade_pct:
             best_trade_pct = pct
+            best_trade = trade
 
         if pct > 0:
             wins += 1
@@ -1001,6 +1005,7 @@ def _tournament_score(
         "flat": flat,
         "win_rate": win_rate,
         "qualified": closed_trades >= TOURNAMENT_MIN_CLOSED_TRADES,
+        "best_trade": best_trade,
     }
 
 
@@ -1043,6 +1048,36 @@ def _resolve_tournament_results_channel():
     return None
 
 
+def _fmt_best_trade(trade: dict | None) -> str | None:
+    """Format the user's best tournament trade for leaderboard/result embeds."""
+    if not trade:
+        return None
+
+    action = trade.get("action", "")
+    qty = trade.get("qty", "")
+    ticker = trade.get("ticker", "")
+    strike = trade.get("strike", "")
+    expiry = trade.get("expiry", "")
+    price_text = trade.get("price_text", "")
+    opened_at = trade.get("opened_at")
+
+    if not all([action, ticker, strike, expiry, price_text]):
+        return None
+
+    exit_price_str = fmt_price_short(str(price_text))
+
+    if opened_at:
+        opened_dt = _parse_iso_datetime(opened_at)
+        if opened_dt is not None:
+            opened_str = opened_dt.strftime("%m/%d")
+            return (
+                f"↳ Best trade: `{action} {qty} {ticker} {strike} {expiry} "
+                f"@ {exit_price_str}` (opened {opened_str})"
+            )
+
+    return f"↳ Best trade: `{action} {qty} {ticker} {strike} {expiry} @ {exit_price_str}`"
+
+
 def _build_monthly_results_embed(month_start: datetime, month_end: datetime, month_label: str) -> discord.Embed:
     rows = _leaderboard_rows(month_start, month_end, month_start.strftime("%Y-%m"))
     qualified = [(uid, stats) for uid, stats in rows if stats["qualified"]]
@@ -1067,6 +1102,9 @@ def _build_monthly_results_embed(month_start: datetime, month_end: datetime, mon
                 f"{prefix} **{name}** — **{fmt_pct(stats['score'])}** "
                 f"| {stats['closed_trades']} closed | Win Rate {stats['win_rate']:.1f}%{prize_note}"
             )
+            best_trade_line = _fmt_best_trade(stats.get("best_trade"))
+            if best_trade_line:
+                lines.append(best_trade_line)
     else:
         lines.append("No traders met the minimum closed-trade requirement this month.")
         lines.append("")
@@ -1078,6 +1116,9 @@ def _build_monthly_results_embed(month_start: datetime, month_end: datetime, mon
                 f"#{idx} **{name}** — {fmt_pct(stats['score'])} "
                 f"| {stats['closed_trades']} closed"
             )
+            best_trade_line = _fmt_best_trade(stats.get("best_trade"))
+            if best_trade_line:
+                lines.append(best_trade_line)
 
     embed = discord.Embed(
         title=f"🏆 BLACKOUT Monthly Results — {month_label}",
@@ -1451,8 +1492,7 @@ async def rank_command(ctx):
     rows = _leaderboard_rows(effective_month=effective_month)
     rank = next((i for i, (uid, _) in enumerate(rows, start=1) if uid == user_id), None)
     
-    month_start, month_end, _ = _month_bounds_utc_from_effective_month(effective_month)
-    stats = _tournament_score(user_id, month_start, month_end)
+    stats = _tournament_score(user_id)
     needed = max(0, TOURNAMENT_MIN_CLOSED_TRADES - stats["closed_trades"])
     
     month_label = _month_bounds_utc_from_effective_month(effective_month)[2]
