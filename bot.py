@@ -12,8 +12,6 @@ from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-UW_API_KEY = os.getenv("UW_API_KEY")
-UW_API_BASE = "https://api.unusualwhales.com"
 DELETE_CONFIRM_TTL = 30  # second
 # For Railway persistence: change to "/data/bot_data.json" after adding volume
 DATA_FILE = "/data/bot_data.json"
