@@ -27,22 +27,6 @@ OPEN_POSITION_ALERT_MINUTE_PT = int(os.getenv("OPEN_POSITION_ALERT_MINUTE_PT", "
 # Optional fallback if a user has open trades from old data before channel tracking existed.
 OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNEL_ID", "0"))
 
-# Only these channels will accept trade entries.
-# If both are 0, trade parsing is allowed in all channels.
-ADMIN_ALERTS_CHANNEL_ID = int(os.getenv("ADMIN_ALERTS_CHANNEL_ID", "0"))
-MEMBER_ALERTS_CHANNEL_ID = int(os.getenv("MEMBER_ALERTS_CHANNEL_ID", "0"))
-VIP_ALERTS_CHANNEL_ID = int(os.getenv("VIP_ALERTS_CHANNEL_ID", "0"))
-SWING_ALERTS_CHANNEL_ID = int(os.getenv("SWING_ALERTS_CHANNEL_ID", "0"))
-LEAP_ALERTS_CHANNEL_ID = int(os.getenv("LEAP_ALERTS_CHANNEL_ID", "0"))
-ALLOWED_TRADE_CHANNEL_IDS = {
-   cid for cid in (
-        ADMIN_ALERTS_CHANNEL_ID,
-        MEMBER_ALERTS_CHANNEL_ID,
-        VIP_ALERTS_CHANNEL_ID,
-        SWING_ALERTS_CHANNEL_ID,
-        LEAP_ALERTS_CHANNEL_ID,
-    ) if cid
-}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -1455,12 +1439,6 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Only process trade entries in approved alert channels, when configured.
-    # Commands like !current, !stats, !daily still work in other channels.
-    if ALLOWED_TRADE_CHANNEL_IDS and message.channel.id not in ALLOWED_TRADE_CHANNEL_IDS:
-        await bot.process_commands(message)
-        return
-
     matched = await process_trade_message(message)
 
     if not matched and looks_like_trade_command(message.content):
@@ -1480,9 +1458,6 @@ async def on_message_edit(before, after):
     editing a valid trade (e.g. fixing a typo in the price) would re-process it
     and double-count the position."""
     if after.author.bot:
-        return
-
-    if ALLOWED_TRADE_CHANNEL_IDS and after.channel.id not in ALLOWED_TRADE_CHANNEL_IDS:
         return
 
     # Already processed when first sent — ignore the edit.
