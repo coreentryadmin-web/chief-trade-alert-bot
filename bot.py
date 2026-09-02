@@ -32,6 +32,12 @@ API_SECRET = os.getenv("CHIEF_TRADE_API_SECRET", "").strip()
 API_USER_ID = int(os.getenv("CHIEF_TRADE_DISCORD_USER_ID", "0") or "0")
 API_CHANNEL_ID = int(os.getenv("CHIEF_TRADE_CHANNEL_ID", "0") or "0")
 posted_idempotency_keys = set()
+desk_ready = False
+
+
+def is_desk_ready() -> bool:
+    """True once the Discord gateway session is up (safe for HTTP ingest)."""
+    return desk_ready and bot.user is not None
 
 
 intents = discord.Intents.default()
@@ -1249,7 +1255,9 @@ def start_api_server():
 
 @bot.event
 async def on_ready():
+    global desk_ready
     load_data()
+    desk_ready = True
     print(f"Logged in as {bot.user}")
     desk_id = resolve_desk_user_id()
     if desk_id:
