@@ -33,57 +33,11 @@ API_USER_ID = int(os.getenv("CHIEF_TRADE_DISCORD_USER_ID", "0") or "0")
 API_CHANNEL_ID = int(os.getenv("CHIEF_TRADE_CHANNEL_ID", "0") or "0")
 posted_idempotency_keys = set()
 desk_ready = False
-_discord_thread_started = False
 
 
 def is_desk_ready() -> bool:
     """True once the Discord gateway session is up (safe for HTTP ingest)."""
     return desk_ready and bot.user is not None
-
-
-def desk_diagnostics() -> dict:
-    """Non-secret config probe for /health (Railway debugging)."""
-    loop_running = False
-    try:
-        loop = bot.loop
-        loop_running = bool(loop and loop.is_running())
-    except AttributeError:
-        loop_running = False
-    return {
-        "discord_token_set": bool((TOKEN or "").strip()),
-        "api_secret_set": bool(API_SECRET),
-        "channel_id_set": bool(API_CHANNEL_ID),
-        "channel_id": API_CHANNEL_ID or None,
-        "discord_thread_started": _discord_thread_started,
-        "discord_loop_running": loop_running,
-    }
-
-
-def ensure_discord_started() -> None:
-    """Start Discord when HTTP is the Railway entrypoint (uvicorn api_server:app)."""
-    global _discord_thread_started
-    if is_desk_ready() or bot.is_ready():
-        return
-    if bot.loop and bot.loop.is_running():
-        return
-    if _discord_thread_started:
-        return
-    if not (TOKEN or "").strip():
-        print("DISCORD_TOKEN is not set — Discord desk disabled")
-        return
-
-    import threading
-
-    _discord_thread_started = True
-
-    def _run() -> None:
-        try:
-            print("Discord bot thread starting…")
-            bot.run(TOKEN)
-        except Exception as exc:
-            print(f"Discord bot exited: {exc}")
-
-    threading.Thread(target=_run, name="discord-bot", daemon=True).start()
 
 
 intents = discord.Intents.default()
