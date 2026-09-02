@@ -6,7 +6,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,12 @@ OPEN_POSITION_ALERT_HOUR_PT = int(os.getenv("OPEN_POSITION_ALERT_HOUR_PT", "13")
 OPEN_POSITION_ALERT_MINUTE_PT = int(os.getenv("OPEN_POSITION_ALERT_MINUTE_PT", "15"))
 # Optional fallback if a user has open trades from old data before channel tracking existed.
 OPEN_POSITION_FALLBACK_CHANNEL_ID = int(os.getenv("OPEN_POSITION_FALLBACK_CHANNEL_ID", "0"))
+
+# Desk API (0DTE / Night Hawk auto-post)
+API_SECRET = os.getenv("CHIEF_TRADE_API_SECRET", "").strip()
+API_USER_ID = int(os.getenv("CHIEF_TRADE_DISCORD_USER_ID", "0") or "0")
+API_CHANNEL_ID = int(os.getenv("CHIEF_TRADE_CHANNEL_ID", "0") or "0")
+posted_idempotency_keys = set()
 
 
 intents = discord.Intents.default()
@@ -228,7 +234,8 @@ def save_data():
         "user_stats": {},
         "trade_history": {},
         "pending_deletes": {},
-        "last_trade_channels": {}
+        "last_trade_channels": {},
+        "posted_idempotency_keys": list(posted_idempotency_keys)[-5000:],
     }
 
     # Convert positions, preserving Decimal values as strings
@@ -379,6 +386,9 @@ def load_data():
         int(user_id_str): int(channel_id)
         for user_id_str, channel_id in data.get("last_trade_channels", {}).items()
     }
+
+    global posted_idempotency_keys
+    posted_idempotency_keys = set(data.get("posted_idempotency_keys", []))
 
 
 
@@ -963,8 +973,19 @@ async def daily_command(ctx, member: discord.Member = None):
     target = member or ctx.author
     history = trade_history[target.id]
 
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    today_trades = [t for t in history if t["timestamp"].startswith(today)]
+    today = datetime.now(PACIFIC_TZ).strftime("%Y-%m-%d")
+
+    def trade_on_pacific_day(trade):
+        ts = trade["timestamp"]
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(PACIFIC_TZ).strftime("%Y-%m-%d") == today
+        except Exception:
+            return ts.startswith(today)
+
+    today_trades = [t for t in history if trade_on_pacific_day(t)]
 
     if not today_trades:
         embed = discord.Embed(
@@ -1196,94 +1217,114 @@ async def confirm_command(ctx):
     await ctx.send(embed=embed)
 
 
+def resolve_desk_user_id() -> int:
+    """Desk trades attach to CHIEF_TRADE_DISCORD_USER_ID, or the bot itself when unset."""
+    if API_USER_ID:
+        return API_USER_ID
+    if bot.user:
+        return bot.user.id
+    return 0
+
+
+def start_api_server():
+    """Run FastAPI ingest in a background thread (desk 0DTE auto-post)."""
+    if not API_SECRET:
+        print("CHIEF_TRADE_API_SECRET not set — HTTP ingest disabled")
+        return
+    if hasattr(bot, "api_server_started"):
+        return
+    bot.api_server_started = True
+
+    import threading
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8080"))
+
+    def run():
+        uvicorn.run("api_server:app", host="0.0.0.0", port=port, log_level="info")
+
+    threading.Thread(target=run, daemon=True).start()
+    print(f"Chief Trade API listening on :{port}")
+
+
 @bot.event
 async def on_ready():
     load_data()
     print(f"Logged in as {bot.user}")
+    desk_id = resolve_desk_user_id()
+    if desk_id:
+        label = "configured desk user" if API_USER_ID else "bot user (default)"
+        print(f"Desk auto-post trades attributed to {desk_id} ({label})")
+    start_api_server()
 
     if not hasattr(bot, "eod_task_started"):
         bot.eod_task_started = True
         bot.loop.create_task(end_of_day_task_loop())
 
 
-
-async def process_trade_message(message):
-    """Parse a message as a trade and post the embed.
-
-    Returns True if the message matched the trade pattern (so the caller knows
-    not to fall through to the format-help reply). Returns False if the message
-    is not a trade at all.
-    """
-    match = pattern.match(message.content)
-    if not match:
-        return False
-
-    action, qty, ticker, strike, expiry, price_text = match.groups()
-
+async def execute_structured_trade(
+    *,
+    user_id: int,
+    channel,
+    action: str,
+    qty: int,
+    ticker: str,
+    strike: str,
+    expiry: str,
+    price_text: str,
+    author_name: str,
+    author_icon_url=None,
+    idempotency_key=None,
+    timestamp=None,
+):
+    """Execute a parsed trade and post the Core Entry embed. Used by chat + HTTP ingest."""
     action = action.upper().strip()
-    qty = int(qty) if qty else 1  # Default to 1 if not provided
+    qty = max(1, int(qty))
     ticker = ticker.upper().strip()
     strike = strike.upper().strip()
     expiry = expiry.strip()
 
-    # Block users from opening already-expired contracts.
-    # Same-day 0DTE trades are still allowed.
+    if idempotency_key:
+        if idempotency_key in posted_idempotency_keys:
+            return {"ok": True, "duplicate": True, "idempotency_key": idempotency_key}
+        posted_idempotency_keys.add(idempotency_key)
+
     expiry_date = parse_expiry_date_pt(expiry)
     today_pt = datetime.now(PACIFIC_TZ).date()
 
     if action in ["BTO", "STO"] and expiry_date is not None and expiry_date < today_pt:
-        await message.channel.send(
-            f"❌ Cannot open expired contract: {ticker} {strike} {expiry}.",
-            delete_after=8,
-        )
-        return True
+        return {"ok": False, "error": f"Cannot open expired contract: {ticker} {strike} {expiry}."}
 
-    # FIX 1: Block @m BEFORE recording the channel. A rejected trade should not
-    # cause the user to receive EOD alerts or auto-expire notices.
     if is_market_price(price_text):
-        await message.channel.send(
-            "❌ Market price `@m` is disabled. Please enter a manual price like `@ 1.25`.",
-            delete_after=10,
-        )
-        return True
+        return {"ok": False, "error": "Market price `@m` is disabled. Please enter a manual price."}
 
-    # FIX 4: Validate that the price parsed successfully before proceeding.
-    # parse_price() returns None for @m (already blocked above) and also for
-    # any malformed value that slips past the regex — guard against that here.
     numeric_price = parse_price(price_text)
     if numeric_price is None:
-        await message.channel.send(
-            f"❌ Invalid price `{price_text}`. Please enter a numeric price like `@ 1.25`.",
-            delete_after=10,
-        )
-        return True
+        return {"ok": False, "error": f"Invalid price `{price_text}`."}
 
-    # Only record the channel on a trade we're actually going to process.
-    last_trade_channels[message.author.id] = message.channel.id
+    last_trade_channels[user_id] = channel.id
 
     display_price = fmt_price_text(price_text)
     price_text_for_log = price_text
-
     color = get_color(action)
     title = f"{ticker} {strike} {expiry}"
+    embed_timestamp = timestamp or datetime.now(timezone.utc)
 
     if action in ["BTO", "STO"]:
         side = "LONG" if action == "BTO" else "SHORT"
 
-        # FIX 2: Open the position BEFORE logging it. If add_open_position ever
-        # raises, we won't have a dangling history entry with no matching position.
         add_open_position(
-            user_id=message.author.id,
+            user_id=user_id,
             ticker=ticker,
             strike=strike,
             expiry=expiry,
             side=side,
             qty=qty,
-            entry_price=numeric_price
+            entry_price=numeric_price,
         )
 
         log_trade(
-            user_id=message.author.id,
+            user_id=user_id,
             action=action,
             qty=qty,
             ticker=ticker,
@@ -1291,7 +1332,7 @@ async def process_trade_message(message):
             expiry=expiry,
             price_text=price_text_for_log,
             total_pnl=None,
-            pnl_pct=None
+            pnl_pct=None,
         )
 
         save_data()
@@ -1302,20 +1343,20 @@ async def process_trade_message(message):
         embed = discord.Embed(
             title=title,
             description=description,
-            color=color
+            color=color,
         )
 
     elif action in ["STC", "BTC"]:
         side = "LONG" if action == "STC" else "SHORT"
 
         result = close_position(
-            user_id=message.author.id,
+            user_id=user_id,
             ticker=ticker,
             strike=strike,
             expiry=expiry,
             side=side,
             close_qty=qty,
-            exit_price=numeric_price
+            exit_price=numeric_price,
         )
 
         matched_qty = result["matched_qty"]
@@ -1333,24 +1374,22 @@ async def process_trade_message(message):
         total_opened_overall = result["total_opened_overall"]
 
         if matched_qty == 0:
-            await message.channel.send(
-                f"❌ No open position found for {ticker} {strike} {expiry}",
-                delete_after=5
-            )
-            return True
+            if idempotency_key and idempotency_key in posted_idempotency_keys:
+                posted_idempotency_keys.discard(idempotency_key)
+            return {"ok": False, "error": f"No open position found for {ticker} {strike} {expiry}"}
 
-        # FIX 3: Warn the user when they requested more contracts than were open.
-        # The close still proceeds for the matched quantity — we just surface the
-        # mismatch so they know not all of their requested qty was filled.
         if matched_qty < qty:
-            await message.channel.send(
-                f"⚠️ Only {matched_qty} of {qty} requested contracts were open for "
-                f"{ticker} {strike} {expiry}. Closed {matched_qty}.",
-                delete_after=12,
-            )
+            try:
+                await channel.send(
+                    f"⚠️ Only {matched_qty} of {qty} requested contracts were open for "
+                    f"{ticker} {strike} {expiry}. Closed {matched_qty}.",
+                    delete_after=12,
+                )
+            except discord.HTTPException:
+                pass
 
         log_trade(
-            user_id=message.author.id,
+            user_id=user_id,
             action=action,
             qty=matched_qty,
             ticker=ticker,
@@ -1360,7 +1399,7 @@ async def process_trade_message(message):
             total_pnl=total_pnl,
             pnl_pct=pnl_pct,
             opened_at=result.get("opened_at"),
-            matched_opened_at=result.get("matched_opened_at", [])
+            matched_opened_at=result.get("matched_opened_at", []),
         )
         save_data()
 
@@ -1379,7 +1418,7 @@ async def process_trade_message(message):
         embed = discord.Embed(
             title=title,
             description=description,
-            color=color
+            color=color,
         )
 
         if partial_close:
@@ -1396,7 +1435,7 @@ async def process_trade_message(message):
         summary_lines = [
             f"This Close: {matched_qty}",
             f"Previously Closed: {previous_closed_qty}",
-            f"Total Closed Overall: {total_closed_overall}/{total_opened_overall}"
+            f"Total Closed Overall: {total_closed_overall}/{total_opened_overall}",
         ]
 
         if avg_exit_price is not None:
@@ -1412,25 +1451,77 @@ async def process_trade_message(message):
         embed.add_field(
             name="Trade Summary",
             value="\n".join(summary_lines),
-            inline=False
+            inline=False,
         )
 
         if fully_closed:
             embed.add_field(name="Status", value="Position fully closed.", inline=False)
 
-    embed.set_author(
-        name=message.author.display_name,
-        icon_url=message.author.display_avatar.url
-    )
-    embed.set_footer(text="Core Entry Alerts")
-    embed.timestamp = message.created_at
+    else:
+        if idempotency_key and idempotency_key in posted_idempotency_keys:
+            posted_idempotency_keys.discard(idempotency_key)
+        return {"ok": False, "error": f"Invalid action: {action}"}
 
+    embed.set_author(name=author_name, icon_url=author_icon_url)
+    embed.set_footer(text="Core Entry Alerts")
+    embed.timestamp = embed_timestamp
+
+    message_id = None
     try:
-        await message.channel.send(embed=embed)
+        sent = await channel.send(embed=embed)
+        message_id = sent.id
     except discord.Forbidden:
         print("Missing permission: Send Messages or Embed Links")
+        return {"ok": False, "error": "Missing Discord send permission"}
     except discord.HTTPException as e:
         print(f"Failed to send embed: {e}")
+        return {"ok": False, "error": f"Discord HTTP error: {e}"}
+
+    return {
+        "ok": True,
+        "action": action,
+        "ticker": ticker,
+        "strike": strike,
+        "expiry": expiry,
+        "qty": qty,
+        "message_id": message_id,
+        "idempotency_key": idempotency_key,
+    }
+
+
+async def process_trade_message(message):
+    """Parse a message as a trade and post the embed.
+
+    Returns True if the message matched the trade pattern (so the caller knows
+    not to fall through to the format-help reply). Returns False if the message
+    is not a trade at all.
+    """
+    match = pattern.match(message.content)
+    if not match:
+        return False
+
+    action, qty, ticker, strike, expiry, price_text = match.groups()
+    qty = int(qty) if qty else 1
+
+    result = await execute_structured_trade(
+        user_id=message.author.id,
+        channel=message.channel,
+        action=action,
+        qty=qty,
+        ticker=ticker,
+        strike=strike,
+        expiry=expiry,
+        price_text=price_text,
+        author_name=message.author.display_name,
+        author_icon_url=message.author.display_avatar.url,
+        timestamp=message.created_at,
+    )
+
+    if not result.get("ok") and not result.get("duplicate"):
+        await message.channel.send(
+            f"❌ {result.get('error', 'Trade rejected')}",
+            delete_after=10,
+        )
 
     return True
 
@@ -1469,7 +1560,7 @@ async def on_message_edit(before, after):
 
 # ---------- Entry point ----------
 
-if not TOKEN:
-    raise ValueError("DISCORD_TOKEN is not set in environment variables")
-
-bot.run(TOKEN)
+if __name__ == "__main__":
+    if not TOKEN:
+        raise ValueError("DISCORD_TOKEN is not set in environment variables")
+    bot.run(TOKEN)
