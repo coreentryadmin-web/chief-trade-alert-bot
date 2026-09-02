@@ -1569,6 +1569,12 @@ async def on_message_edit(before, after):
 # ---------- Entry point ----------
 
 if __name__ == "__main__":
+    import sys
+
+    # python bot.py loads as __main__, but api_server does `import bot` — alias so
+    # desk_ready / the live Client are the same module object the HTTP layer reads.
+    sys.modules["bot"] = sys.modules[__name__]
+
     if not TOKEN:
         raise ValueError("DISCORD_TOKEN is not set in environment variables")
     bot.run(TOKEN)
