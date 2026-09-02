@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException
@@ -10,7 +11,16 @@ from pydantic import BaseModel, Field
 
 import bot
 
-app = FastAPI(title="Chief Trade Alert Bot API", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # uvicorn is already serving this app — don't bind a second HTTP server in on_ready.
+    bot.api_server_started = True
+    bot.ensure_discord_started()
+    yield
+
+
+app = FastAPI(title="Chief Trade Alert Bot API", version="1.0.0", lifespan=lifespan)
 
 
 class TradeIn(BaseModel):
@@ -40,10 +50,12 @@ async def _run_on_bot_loop(coro, timeout: float = 30.0):
 
 @app.get("/health")
 async def health():
+    diag = bot.desk_diagnostics()
     return {
         "ok": True,
         "bot_ready": bot.is_desk_ready(),
         "discord_is_ready": bool(bot.bot and bot.bot.is_ready()),
+        **diag,
     }
 
 
