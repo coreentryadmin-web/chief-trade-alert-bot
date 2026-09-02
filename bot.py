@@ -43,13 +43,19 @@ def is_desk_ready() -> bool:
 
 def desk_diagnostics() -> dict:
     """Non-secret config probe for /health (Railway debugging)."""
+    loop_running = False
+    try:
+        loop = bot.loop
+        loop_running = bool(loop and loop.is_running())
+    except AttributeError:
+        loop_running = False
     return {
         "discord_token_set": bool((TOKEN or "").strip()),
         "api_secret_set": bool(API_SECRET),
         "channel_id_set": bool(API_CHANNEL_ID),
         "channel_id": API_CHANNEL_ID or None,
         "discord_thread_started": _discord_thread_started,
-        "discord_loop_running": bool(bot.loop and bot.loop.is_running()),
+        "discord_loop_running": loop_running,
     }
 
 
